@@ -16,12 +16,26 @@ export function getTranscriptRoute(
   const before = beforeStr ? Number(beforeStr) : undefined;
 
   try {
-    const raw = ctx.deps.readHarnessTranscript(harness as any, harnessSessionId, {
-      transcriptPath,
+    const isOpencodeStubJsonl =
+      harness === "opencode" &&
+      Boolean(transcriptPath) &&
+      !transcriptPath!.toLowerCase().endsWith(".db");
+
+    let raw = ctx.deps.readHarnessTranscript(harness as any, harnessSessionId, {
+      transcriptPath: isOpencodeStubJsonl ? undefined : transcriptPath,
       limit: maxMessages,
       before,
       homeDir: ctx.homeDir,
     });
+
+    if (isOpencodeStubJsonl && (!raw.found || raw.messages.length === 0)) {
+      raw = ctx.deps.readHarnessTranscript(harness as any, harnessSessionId, {
+        transcriptPath,
+        limit: maxMessages,
+        before,
+        homeDir: ctx.homeDir,
+      });
+    }
 
     if (raw.error && !raw.found) {
       const resp: GetTranscriptResponse = {

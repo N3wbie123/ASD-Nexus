@@ -533,6 +533,38 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         await close();
       }
     });
+
+    it("GET /api/transcript/opencode/:id prefers opencode.db over mirrored hook-bridge jsonl stub", async () => {
+      const seenPaths: Array<string | undefined> = [];
+      const { baseUrl, close } = await startTestServer({
+        readHarnessTranscript: (_harness, _sid, opts) => {
+          seenPaths.push(opts?.transcriptPath);
+          return {
+            found: true,
+            harness: "opencode" as any,
+            sessionId: "ses_abc",
+            transcriptPath: opts?.transcriptPath || "/home/.local/share/opencode/opencode.db",
+            messages: [
+              { index: 0, role: "user" as const, text: "hi", category: "user" as const },
+              { index: 1, role: "assistant" as const, text: "hello", category: "assistant" as const },
+            ],
+            hasMore: false,
+            truncated: false,
+          };
+        },
+      });
+      try {
+        const res = await fetch(
+          `${baseUrl}/api/transcript/opencode/ses_abc?projectRoot=/p&transcriptPath=${encodeURIComponent("C:/Users/me/.claude/transcripts/ses_abc.jsonl")}`
+        );
+        assert.equal(res.status, 200);
+        const data = (await res.json()) as GetTranscriptResponse;
+        assert.equal(data.messages.length, 2);
+        assert.deepEqual(seenPaths, [undefined]);
+      } finally {
+        await close();
+      }
+    });
   });
 
   describe("Turn Streaming & Cancellation", () => {
