@@ -93,6 +93,8 @@ export interface OrchestratorDeps {
     planMdPath?: string;
   }) => any;
   generateAsdSessionId: () => string;
+  isValidAsdSessionId: (id: string) => boolean;
+  attachDriver: typeof sdk.attachDriver;
   promoteCliSessionToAsd: (
     options: sdk.PromoteCliSessionOptions
   ) => sdk.PromoteCliSessionResult;
@@ -172,6 +174,8 @@ export function createDefaultDeps(): OrchestratorDeps {
     getForegroundSessionId: sdk.getForegroundSessionId,
     setForegroundSession: sdk.setForegroundSession,
     generateAsdSessionId: sdk.generateAsdSessionId,
+    isValidAsdSessionId: sdk.isValidAsdSessionId,
+    attachDriver: sdk.attachDriver,
     promoteCliSessionToAsd: sdk.promoteCliSessionToAsd,
     buildSessionDemotion: sdk.buildSessionDemotion,
     unlinkHarnessSessionFromAsdSession: sdk.unlinkHarnessSessionFromAsdSession,

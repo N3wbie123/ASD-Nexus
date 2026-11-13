@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import * as child_process from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import * as sdk from "../src/server/sdk.ts";
 import { createOrchestratorApp } from "../src/server/app.ts";
 import type { OrchestratorDeps, AppOptions } from "../src/server/app.ts";
 import {
@@ -533,9 +536,53 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
   });
 
   describe("Turn Streaming & Cancellation", () => {
+    function createMockTurnDbDeps() {
+      let closed = false;
+      const sessions = new Map<string, any>();
+      const drivers = new Map<string, any>();
+      return {
+        isClosed: () => closed,
+        deps: {
+          openProjectDb: () =>
+            ({
+              getSession: (id: string) => sessions.get(id),
+              createOrGetSession: (s: any) => {
+                const row = { session_id: s.sessionId, ...s };
+                sessions.set(s.sessionId, row);
+                return row;
+              },
+              findSessionByHarnessSessionId: () => undefined,
+              getActiveDriver: (id: string) => drivers.get(id),
+              close: () => {
+                closed = true;
+              },
+            } as any),
+          attachDriver: (_db: any, input: any) => {
+            const driver = {
+              driver_id: "drv-mock-1",
+              session_id: input.sessionId,
+              harness: input.harness,
+              model: input.model ?? null,
+              harness_session_id: input.harnessSessionId ?? null,
+              source: input.source ?? "user",
+              attached_at: Date.now(),
+              detached_at: null,
+              detach_reason: null,
+              briefing_injected: 0,
+            };
+            drivers.set(input.sessionId, driver);
+            return { driver, previousDriverId: null, changed: true };
+          },
+        },
+      };
+    }
+
     it("POST /api/turn/stream emits SSE OrchestratorEvent stream and completes", async () => {
+      const mockDb = createMockTurnDbDeps();
       const { baseUrl, close } = await startTestServer({
+        ...mockDb.deps,
         runDriverTurn: async (input) => {
+          assert.ok(input.db);
           input.onEvent({
             type: "thinking",
             harness: "claude-code",
@@ -607,6 +654,7 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         const lastEvt = events.at(-1);
         assert.equal(lastEvt?.kind, "status");
         assert.equal(lastEvt?.status, "done");
+        assert.equal(mockDb.isClosed(), true);
       } finally {
         await close();
       }
@@ -614,7 +662,9 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
 
     it("POST /api/turn/cancel cancels turn and emits interrupted status", async () => {
       let turnIdCaptured = "";
+      const mockDb = createMockTurnDbDeps();
       const { baseUrl, close } = await startTestServer({
+        ...mockDb.deps,
         runDriverTurn: async (input) => {
           return new Promise<any>((resolve, reject) => {
             input.signal.addEventListener("abort", () => {
@@ -684,8 +734,120 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         const lastEvt = streamEvents.at(-1);
         assert.equal(lastEvt?.kind, "status");
         assert.equal(lastEvt?.status, "interrupted");
+        assert.equal(mockDb.isClosed(), true);
       } finally {
         await close();
+      }
+    });
+
+    it("POST /api/turn/stream attaches driver in real SQLite, preserves harnessSessionId on Turn 2, and emits usage from raw output", async () => {
+      const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-turn-db-"));
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-turn-home-"));
+      let callCount = 0;
+      const seenActiveDriverSids: Array<string | null> = [];
+
+      const { baseUrl, close } = await startTestServer(
+        {
+          runDriverTurn: async (input) => {
+            callCount++;
+            assert.ok(input.db);
+            assert.ok(sdk.isValidAsdSessionId(input.sessionId));
+            const active = input.db.getActiveDriver(input.sessionId);
+            assert.ok(active);
+            assert.equal(active.harness, "codex");
+            assert.equal(active.model, "gpt-6-luna");
+            seenActiveDriverSids.push(active.harness_session_id ?? null);
+
+            if (callCount === 1) {
+              input.onOutput?.(
+                JSON.stringify({ type: "thread.started", thread_id: "thr-real-001" }) + "\n"
+              );
+              input.onOutput?.(
+                JSON.stringify({
+                  type: "item.completed",
+                  item: { id: "m1", type: "agent_message", text: "Turn 1 OK" },
+                }) + "\n"
+              );
+              input.onOutput?.(
+                JSON.stringify({
+                  type: "turn.completed",
+                  usage: { input_tokens: 12, output_tokens: 4 },
+                }) + "\n"
+              );
+              sdk.attachDriver(input.db, {
+                projectRoot: input.projectRoot,
+                sessionId: input.sessionId,
+                harness: "codex",
+                model: "gpt-6-luna",
+                harnessSessionId: "thr-real-001",
+                source: "user",
+              });
+              return { exitCode: 0, harnessSessionId: "thr-real-001" } as any;
+            }
+
+            input.onOutput?.(
+              JSON.stringify({
+                type: "item.completed",
+                item: { id: "m2", type: "agent_message", text: "Turn 2 Resumed" },
+              }) + "\n"
+            );
+            return { exitCode: 0, harnessSessionId: active.harness_session_id ?? null } as any;
+          },
+        },
+        { defaultProjectRoot: tmpProject, homeDir: tmpHome }
+      );
+
+      async function collectTurnEvents(payload: Record<string, unknown>) {
+        const res = await fetch(`${baseUrl}/api/turn/stream`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+          },
+          body: JSON.stringify(payload),
+        });
+        assert.equal(res.status, 200);
+        const text = await res.text();
+        return text
+          .split("\n\n")
+          .map((chunk) => chunk.trim())
+          .filter((line) => line.startsWith("data: "))
+          .map((line) => JSON.parse(line.slice(6)) as OrchestratorEvent);
+      }
+
+      try {
+        // Turn 1 with omitted sessionId -> generates ASD session + attaches driver
+        const t1Events = await collectTurnEvents({
+          projectRoot: tmpProject,
+          harness: "codex",
+          model: "gpt-6-luna",
+          prompt: "First turn",
+        });
+        const asdSessionId = t1Events[0]?.sessionId;
+        assert.ok(asdSessionId && asdSessionId.startsWith("asd-"));
+        assert.ok(t1Events.some((e) => e.kind === "text" && e.text === "Turn 1 OK"));
+        const usageEvt = t1Events.find((e) => e.kind === "usage");
+        assert.equal(usageEvt?.usage?.inputTokens, 12);
+        assert.equal(usageEvt?.usage?.outputTokens, 4);
+        const t1Done = t1Events.at(-1);
+        assert.equal(t1Done?.status, "done");
+        assert.equal((t1Done?.raw as any)?.harnessSessionId, "thr-real-001");
+
+        // Turn 2 reusing asdSessionId -> preserves driver.harness_session_id ("thr-real-001")
+        const t2Events = await collectTurnEvents({
+          projectRoot: tmpProject,
+          sessionId: asdSessionId,
+          harness: "codex",
+          model: "gpt-6-luna",
+          prompt: "Second turn",
+        });
+        assert.ok(t2Events.some((e) => e.kind === "text" && e.text === "Turn 2 Resumed"));
+        assert.equal(t2Events.at(-1)?.status, "done");
+        assert.deepEqual(seenActiveDriverSids, [null, "thr-real-001"]);
+      } finally {
+        await close();
+        fs.rmSync(tmpProject, { recursive: true, force: true });
+        fs.rmSync(tmpHome, { recursive: true, force: true });
       }
     });
   });
