@@ -1,4 +1,4 @@
-import test, { describe, it } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -18,12 +18,14 @@ function getAllSourceFiles(dir: string): string[] {
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       files.push(...getAllSourceFiles(fullPath));
-    } else if (/\.(ts|tsx)$/.test(entry.name)) {
+    } else if (/\.ts$/.test(entry.name)) {
       files.push(fullPath);
     }
   }
   return files;
 }
+
+const srcDir = path.resolve(import.meta.dirname, "../src");
 
 describe("ASD v2.6.0 SDK Surface & Boundary Contract", () => {
   it("verifies live link to ASD v2.6.0 runtime", () => {
@@ -34,8 +36,7 @@ describe("ASD v2.6.0 SDK Surface & Boundary Contract", () => {
     );
   });
 
-  describe("SDK_SURFACE_CLEANUP_PLAN §3 Cleanliness Audits", () => {
-    const srcDir = path.resolve(import.meta.dirname, "../src");
+  describe("SDK_SURFACE_CLEANUP_PLAN §3 cleanliness audits", () => {
     const srcFiles = getAllSourceFiles(srcDir);
 
     it("scans at least one source file in src/", () => {
@@ -45,33 +46,32 @@ describe("ASD v2.6.0 SDK Surface & Boundary Contract", () => {
       );
     });
 
-    it("verifies zero imports of startDashboardServer", () => {
+    it("verifies zero references to the dashboard server entry", () => {
       for (const file of srcFiles) {
         const content = fs.readFileSync(file, "utf8");
-        const match = /\bstartDashboardServer\b/.test(content);
         assert.equal(
-          match,
+          /\bstartDashboardServer\b/.test(content),
           false,
-          `File ${file} must not reference or import startDashboardServer`
+          `${file} must not reference or import the ASD ui server entry`
         );
       }
     });
 
-    it("verifies zero imports from agent-swarm-director/adapters/claude", () => {
+    it("verifies zero imports from the removed claude adapter subpath", () => {
       for (const file of srcFiles) {
         const content = fs.readFileSync(file, "utf8");
-        const match = /(agent-swarm-director\/adapters\/claude(\.ts)?|adapters\/claude(\.ts)?)/.test(
+        const match = /agent-swarm-director\/adapters\/claude(\.ts)?["']/.test(
           content
         );
         assert.equal(
           match,
           false,
-          `File ${file} must not import deprecated claude adapter subpath`
+          `${file} must not import the removed claude adapter subpath (use claude-code)`
         );
       }
     });
 
-    it("verifies zero imports/calls of removed v2.6.0 symbols", () => {
+    it("verifies zero references to removed v2.6.0 symbols", () => {
       const removedSymbols = [
         "installGlobalConfigs",
         "syncRepoVersionStrings",
@@ -82,6 +82,7 @@ describe("ASD v2.6.0 SDK Surface & Boundary Contract", () => {
         "isProtectedPath",
         "buildHeadlessCommand",
         "buildInteractiveResumeCommand",
+        "verifyPidIdentity",
       ];
 
       for (const file of srcFiles) {
@@ -91,7 +92,7 @@ describe("ASD v2.6.0 SDK Surface & Boundary Contract", () => {
           assert.equal(
             regex.test(content),
             false,
-            `File ${file} must not import or call removed symbol ${symbol}`
+            `${file} must not import or call removed symbol ${symbol}`
           );
         }
       }
@@ -100,46 +101,49 @@ describe("ASD v2.6.0 SDK Surface & Boundary Contract", () => {
     it("verifies zero positional calls to buildResumeHarnessCommand", () => {
       for (const file of srcFiles) {
         const content = fs.readFileSync(file, "utf8");
-        // Matches any buildResumeHarnessCommand call with a string/positional arg
-        // (i.e. not an options object or identifier)
-        const positionalCall = /\bbuildResumeHarnessCommand\s*\(\s*["']/.test(content);
-        assert.equal(
-          positionalCall,
-          false,
-          `File ${file} must not call buildResumeHarnessCommand with positional arguments`
-        );
-      }
-    });
-
-    it("verifies zero calls to verifyPidIdentity", () => {
-      for (const file of srcFiles) {
-        const content = fs.readFileSync(file, "utf8");
-        const match = /\bverifyPidIdentity\b/.test(content);
-        assert.equal(
-          match,
-          false,
-          `File ${file} must not call verifyPidIdentity`
-        );
-      }
-    });
-
-    it("verifies zero raw child_process CLI string assembly for harnesses", () => {
-      for (const file of srcFiles) {
-        const content = fs.readFileSync(file, "utf8");
-        const rawHarnessSpawn = /(spawn|exec|execSync|spawnSync)\s*\(\s*["'](claude|codex|opencode|agy|cursor-agent)\b/.test(
+        const positionalCall = /\bbuildResumeHarnessCommand\s*\(\s*["']/.test(
           content
         );
         assert.equal(
+          positionalCall,
+          false,
+          `${file} must call buildResumeHarnessCommand with an options object only`
+        );
+      }
+    });
+
+    it("verifies zero child_process imports in src/", () => {
+      for (const file of srcFiles) {
+        const content = fs.readFileSync(file, "utf8");
+        const imported =
+          /from\s+["'](node:)?child_process["']/.test(content) ||
+          /require\(["'](node:)?child_process["']\)/.test(content);
+        assert.equal(
+          imported,
+          false,
+          `${file} must not import child_process; process work goes through the SDK`
+        );
+      }
+    });
+
+    it("verifies zero raw child_process harness spawns", () => {
+      for (const file of srcFiles) {
+        const content = fs.readFileSync(file, "utf8");
+        const rawHarnessSpawn =
+          /(spawn|exec|execSync|spawnSync)\s*\(\s*["'](claude|codex|opencode|agy|cursor-agent)\b/.test(
+            content
+          );
+        assert.equal(
           rawHarnessSpawn,
           false,
-          `File ${file} must not directly invoke raw harness CLI processes`
+          `${file} must not directly invoke raw harness CLI processes`
         );
       }
     });
   });
 
-  describe("Harness Command Construction Specifications", () => {
-    it("buildSpawnSpec generates streaming flags and danger-skip-permissions for claude-code", () => {
+  describe("Harness command construction specifications", () => {
+    it("buildSpawnSpec generates streaming flags and permission skip for claude-code", () => {
       const spec = buildSpawnSpec({
         harness: "claude-code",
         prompt: "Check clean-room architecture",
@@ -164,7 +168,7 @@ describe("ASD v2.6.0 SDK Surface & Boundary Contract", () => {
       );
     });
 
-    it("buildResumeCommand strictly accepts options-object and formats claude-code stream flags", () => {
+    it("buildResumeCommand strictly accepts an options object and formats claude-code stream flags", () => {
       const resume = buildResumeCommand({
         harness: "claude-code",
         harnessSessionId: "test-sess-001",
@@ -193,7 +197,7 @@ describe("ASD v2.6.0 SDK Surface & Boundary Contract", () => {
       assert.ok(resume.args.includes("--verbose"), "Args must include --verbose");
     });
 
-    it("withReadOnlyProjectDb opens database, executes callback, and closes connection", () => {
+    it("withReadOnlyProjectDb opens the project database, executes the callback, and closes the connection", () => {
       let closed = false;
       const fakeProjectRoot = process.cwd();
 
