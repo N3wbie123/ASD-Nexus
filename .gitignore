@@ -2,5 +2,7 @@ node_modules/
 dist/
 .asd/
 .vite/
+.omo/
+.claude/
 native/target/
 *.local

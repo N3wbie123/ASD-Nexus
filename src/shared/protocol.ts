@@ -92,6 +92,17 @@ export interface SidecarReadyInfo {
 }
 
 // ============================================================================
+// Health
+// ============================================================================
+
+export interface GetHealthResponse {
+  ok: boolean;
+  version: string;
+  defaultProjectRoot: string;
+  pid: number;
+}
+
+// ============================================================================
 // Projects
 // ============================================================================
 
@@ -109,6 +120,19 @@ export interface ListProjectsRequest {
 
 export interface ListProjectsResponse {
   projects: ProjectSummaryItem[];
+}
+
+export interface SelectProjectRequest {
+  projectRoot: string;
+  initialize?: boolean;
+}
+
+export interface SelectProjectResponse {
+  success: boolean;
+  projectRoot: string;
+  projectHash: string;
+  paths: Record<string, string>;
+  error?: string;
 }
 
 export interface ResolveProjectPathsRequest {
@@ -269,6 +293,33 @@ export interface SetSessionPhaseRequest {
   phase: SessionPhase;
 }
 
+export interface CreateSessionRequest {
+  projectRoot?: string;
+  harness?: string;
+  model?: string;
+  title?: string;
+  memo?: string;
+  makeForeground?: boolean;
+}
+
+export interface CreateSessionResponse {
+  success: boolean;
+  sessionId: string;
+  phase: SessionPhase;
+  error?: string;
+}
+
+export interface GetResumeCommandResponse {
+  success: boolean;
+  harness: string;
+  harnessSessionId?: string;
+  command: string;
+  args: string[];
+  cliString: string;
+  cwd: string;
+  error?: string;
+}
+
 export interface SetSessionPhaseResponse {
   success: boolean;
   error?: string;
@@ -378,12 +429,41 @@ export interface GetBoardResponse {
 
 export interface PlanSyncRequest {
   projectRoot?: string;
-  sessionId: string;
+  sessionId?: string;
   planMdPath?: string;
 }
 
 export interface PlanSyncResponse {
   success: boolean;
+  sessionId?: string;
+  tasksUpdated?: number;
+  stateVersion?: number;
+  error?: string;
+}
+
+export interface GetPlanResponse {
+  sessionId?: string;
+  planMdPath: string;
+  exists: boolean;
+  content: string;
+  mtimeMs?: number;
+  sha256?: string;
+}
+
+export interface SavePlanRequest {
+  projectRoot?: string;
+  sessionId?: string;
+  content: string;
+  /** Optimistic concurrency token from GetPlanResponse.sha256 */
+  expectedSha256?: string;
+  syncToDb?: boolean;
+}
+
+export interface SavePlanResponse {
+  success: boolean;
+  conflict?: boolean;
+  sha256?: string;
+  mtimeMs?: number;
   tasksUpdated?: number;
   error?: string;
 }
@@ -430,13 +510,19 @@ export interface WorktreeDiffFile {
 
 export interface WorktreeDiffRequest {
   projectRoot?: string;
-  taskId: string;
+  taskId?: string;
+  turn?: number;
+  wtPath?: string;
+  base?: "HEAD" | "merge-base";
 }
 
 export interface WorktreeDiffResponse {
-  taskId: string;
+  taskId?: string;
   worktreePath?: string;
+  mode?: "working" | "committed";
+  baseRef?: string;
   files: WorktreeDiffFile[];
+  statusShort?: string;
   diffText?: string;
   error?: string;
 }
@@ -506,7 +592,7 @@ export interface SubagentLogTailResponse {
   error?: string;
 }
 
-export type SubagentControlActionKind = "kill" | "retry" | "fallback" | "custom";
+export type SubagentControlActionKind = "kill" | "retry" | "fallback" | "custom" | "resume";
 
 export interface SubagentActionRequest {
   projectRoot?: string;
@@ -541,6 +627,9 @@ export interface TerminalOpenResponse {
   success: boolean;
   /** Interactive resume command for the harness session (copyable). */
   command?: string;
+  args?: string[];
+  cliString?: string;
+  cwd?: string;
   launched?: boolean;
   error?: string;
 }
