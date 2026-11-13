@@ -1,0 +1,10 @@
+{"type":"thread.started","thread_id":"01a1b12a-1111-4222-8333-444455556666"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"reasoning","summary":[]}}
+{"type":"item.completed","item":{"id":"item_0","type":"reasoning","summary":[{"type":"summary_text","text":"Considering the task."}]}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"OK"}}
+{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"git status","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"git status","aggregated_output":"On branch main","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_3","type":"mcp_tool_call","server":"fs","tool":"read_file","arguments":{"path":"a.txt"},"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"mcp_tool_call","server":"fs","tool":"read_file","arguments":{"path":"a.txt"},"output":"file content here","status":"completed"}}
+{"type":"turn.completed","usage":{"input_tokens":18720,"cached_input_tokens":512,"output_tokens":310,"reasoning_output_tokens":64}}

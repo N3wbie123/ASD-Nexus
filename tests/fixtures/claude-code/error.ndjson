@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","cwd":"/proj/demo","session_id":"0a1b2c3d-0000-4000-8000-0000000000ee","tools":["Bash"],"model":"claude-sonnet-4"}
+{"type":"assistant","message":{"id":"msg_err1","role":"assistant","content":[{"type":"text","text":"Attempting the request."}]},"session_id":"0a1b2c3d-0000-4000-8000-0000000000ee"}
+{"type":"system","subtype":"api_retry","retryAttempt":1,"error":{"message":"429 rate limited"}}
+{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":500,"total_cost_usd":0.0001,"usage":{"input_tokens":10,"output_tokens":5},"session_id":"0a1b2c3d-0000-4000-8000-0000000000ee","result":"API Error: rate limited"}

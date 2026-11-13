@@ -1,0 +1,2 @@
+{"type":"step_start","timestamp":1763000010000,"sessionID":"ses_abc123def456789"}
+{"type":"error","name":"ProviderError","message":"rate limit exceeded"}

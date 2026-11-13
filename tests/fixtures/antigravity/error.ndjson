@@ -1,0 +1,3 @@
+{"event":"init","conversation_id":"conv_ee11aa22"}
+{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"agent_response","text_delta":"Working on it."}}
+{"event":"result","result":{"response":"Working on it.","status":"FAILED","error":{"message":"sandbox denied"}}}
