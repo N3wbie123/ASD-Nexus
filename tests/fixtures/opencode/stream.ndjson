@@ -1,0 +1,5 @@
+{"type":"step_start","timestamp":1763000000000,"sessionID":"ses_abc123def456789"}
+{"type":"reasoning","part":{"id":"prt_0","sessionID":"ses_abc123def456789","type":"reasoning","text":"thinking internally about the repo"}}
+{"type":"text","part":{"id":"prt_1","sessionID":"ses_abc123def456789","type":"text","text":"Checking the project files."}}
+{"type":"tool","part":{"id":"prt_2","sessionID":"ses_abc123def456789","type":"tool","callID":"call_1","tool":"bash","state":{"status":"completed","input":{"command":"ls"},"output":"file.txt","title":"ls"}}}
+{"type":"step_finish","part":{"id":"prt_3","sessionID":"ses_abc123def456789","type":"step_finish","tokens":{"input":420,"output":88,"reasoning":24,"cache":{"read":100,"write":10}},"cost":0.0031}}

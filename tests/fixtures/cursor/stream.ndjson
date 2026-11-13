@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","session_id":"chat-9d2e1f0a","model":"composer-1","tools":["read","shell"]}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"list the files"}]}}
+{"type":"thinking","subtype":"delta","text":"Need a listing first."}
+{"type":"tool_call","subtype":"started","call_id":"call_01","tool_call":{"shellToolCall":{"args":{"command":"ls"}}}}
+{"type":"tool_call","subtype":"completed","call_id":"call_01","tool_call":{"shellToolCall":{"args":{"command":"ls"},"result":{"success":{"output":"a.txt\nb.txt"}}}}}
+{"type":"assistant","message":{"role":"assistant","model_call_id":"mc_1","content":[{"type":"text","text":"Here are the files: a.txt, b.txt."}]}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"chat-9d2e1f0a","usage":{"input_tokens":300,"output_tokens":40},"total_cost_usd":0.0012}

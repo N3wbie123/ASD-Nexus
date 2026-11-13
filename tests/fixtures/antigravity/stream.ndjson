@@ -1,0 +1,5 @@
+{"event":"init","conversation_id":"conv_7f3a2b9c"}
+{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"agent_response","text_delta":"Analyzing "}}
+{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"agent_response","text_delta":"the request."}}
+{"event":"step_update","step_update":{"state":"DONE","step_type":"agent_response","text_delta":""}}
+{"event":"result","result":{"response":"Analyzing the request.","status":"SUCCESS"}}
