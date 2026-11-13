@@ -1,0 +1,109 @@
+{
+  "generatedAt": "2026-11-13T13:50:09.420Z",
+  "totalHarnesses": 5,
+  "allPassed": true,
+  "harnesses": [
+    {
+      "harness": "claude-code",
+      "model": "haiku",
+      "durationMs": 22584,
+      "asdSessionId": "asd-20261113-224847-0jsb",
+      "harnessSessionId": "622e8bca-82ca-4951-94ec-06ffa5ca0f01",
+      "turn1EventKinds": [
+        "status",
+        "text",
+        "usage"
+      ],
+      "turn2Text": "AMBER-42",
+      "discovered": true,
+      "transcriptMessages": 4,
+      "transcriptCategories": [
+        "user",
+        "assistant"
+      ],
+      "passed": true
+    },
+    {
+      "harness": "codex",
+      "model": "gpt-6-luna",
+      "durationMs": 11490,
+      "asdSessionId": "asd-20261113-224910-n0f6",
+      "harnessSessionId": "01a1d52b-5ab4-7613-a28b-6427bdff823d",
+      "turn1EventKinds": [
+        "status",
+        "text",
+        "usage"
+      ],
+      "turn2Text": "AMBER-42",
+      "discovered": true,
+      "transcriptMessages": 5,
+      "transcriptCategories": [
+        "user",
+        "assistant"
+      ],
+      "passed": true
+    },
+    {
+      "harness": "opencode",
+      "model": "opencode/glm-5.3-flash-free",
+      "durationMs": 17560,
+      "asdSessionId": "asd-20261113-224922-mqzd",
+      "harnessSessionId": "ses_e2ad47152ffe5xfe4vHLx3mSkE",
+      "turn1EventKinds": [
+        "status",
+        "text",
+        "usage"
+      ],
+      "turn2Text": "AMBER-42",
+      "discovered": true,
+      "transcriptMessages": 4,
+      "transcriptCategories": [
+        "user",
+        "assistant"
+      ],
+      "passed": true
+    },
+    {
+      "harness": "antigravity",
+      "model": "gemini-3.8-flash-low",
+      "durationMs": 14173,
+      "asdSessionId": "asd-20261113-224939-h3gq",
+      "harnessSessionId": "d0897362-4bbb-4b57-b831-8309ca386a68",
+      "turn1EventKinds": [
+        "status",
+        "text"
+      ],
+      "turn2Text": "AMBER-42",
+      "discovered": true,
+      "transcriptMessages": 5,
+      "transcriptCategories": [
+        "user",
+        "assistant",
+        "tool_result"
+      ],
+      "passed": true
+    },
+    {
+      "harness": "cursor",
+      "model": "default",
+      "durationMs": 15429,
+      "asdSessionId": "asd-20261113-224953-evdi",
+      "harnessSessionId": "93a17358-0c59-4224-bb6c-7e55cec3d506",
+      "turn1EventKinds": [
+        "status",
+        "thinking",
+        "text",
+        "usage"
+      ],
+      "turn2Text": "AMBER-42",
+      "discovered": true,
+      "transcriptMessages": 17,
+      "transcriptCategories": [
+        "user",
+        "thinking",
+        "assistant"
+      ],
+      "passed": true
+    }
+  ]
+}
