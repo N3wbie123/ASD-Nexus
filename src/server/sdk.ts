@@ -1,10 +1,10 @@
 /**
- * ASD v2.6.0 Official SDK Boundary (src/server/sdk.ts)
+ * ASD v2.6.0+ Official SDK Boundary (src/server/sdk.ts)
  *
  * Single import point through which the ASD-Nexus sidecar server touches the
- * `agent-swarm-director` runtime. Re-exports ONLY the documented v2.6.0 public
- * surface (EXTERNAL_SDK_REFERENCE.md + SDK_SURFACE_CLEANUP_PLAN.md §3): no
- * dashboard-server entry, no removed aliases, no adapter-method leftovers.
+ * `agent-swarm-director` runtime. Re-exports ONLY the documented v2.6.0+
+ * public surface (EXTERNAL_SDK_REFERENCE.md + SDK_SURFACE_CLEANUP_PLAN.md §3):
+ * no dashboard-server entry, no removed aliases, no adapter-method leftovers.
  *
  * Process discipline: harness CLI command assembly happens exclusively through
  * the buildSpawnSpec family below; this module never spawns processes itself.
@@ -84,7 +84,7 @@ import type {
 } from "agent-swarm-director";
 
 // ============================================================================
-// Re-exported public values & functions (v2.6.0 surface only)
+// Re-exported public values & functions (v2.6.0+ surface)
 // ============================================================================
 
 export {
@@ -148,7 +148,7 @@ export {
 };
 
 // ============================================================================
-// Re-exported public types (v2.6.0 surface only)
+// Re-exported public types (v2.6.0+ surface)
 // ============================================================================
 
 export type {
@@ -195,8 +195,8 @@ export interface BuildResumeCommandOptions {
 
 /**
  * Strict options-object-only wrapper around buildResumeHarnessCommand.
- * The runtime function is options-only in v2.6.0; this wrapper keeps that
- * contract explicit for server call sites.
+ * The runtime function has been options-only since v2.6.0; this wrapper keeps
+ * that contract explicit for server call sites.
  */
 export function buildResumeCommand(
   options: BuildResumeCommandOptions
@@ -226,5 +226,66 @@ export function withReadOnlyProjectDb<T>(
     return fn(db);
   } finally {
     db.close();
+  }
+}
+
+// ============================================================================
+// Runtime version compatibility
+// ============================================================================
+
+/**
+ * Oldest `agent-swarm-director` runtime release this sidecar supports.
+ * Any runtime whose numeric version is greater than or equal to this baseline
+ * is accepted, so 2.6.x, 2.7.x and later majors keep working unchanged.
+ */
+export const MIN_ASD_VERSION = "2.6.0";
+
+export interface AsdVersionParts {
+  major: number;
+  minor: number;
+  patch: number;
+}
+
+/**
+ * Parses the leading `major.minor.patch` numeric core of a runtime version.
+ * Pre-release and build suffixes are ignored (`2.6.0-beta.1` reads as `2.6.0`).
+ */
+export function parseAsdVersion(version: string): AsdVersionParts {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
+  const [, major, minor, patch] = match ?? [];
+  if (major === undefined || minor === undefined || patch === undefined) {
+    throw new Error(`Unparseable ASD runtime version: "${version}"`);
+  }
+  return {
+    major: Number(major),
+    minor: Number(minor),
+    patch: Number(patch),
+  };
+}
+
+/** Numeric-core comparison following semver precedence. */
+export function compareAsdVersions(a: string, b: string): number {
+  const left = parseAsdVersion(a);
+  const right = parseAsdVersion(b);
+  return (
+    left.major - right.major ||
+    left.minor - right.minor ||
+    left.patch - right.patch
+  );
+}
+
+/** True when `version` is at least {@link MIN_ASD_VERSION}. */
+export function isSupportedAsdVersion(version: string = ASD_VERSION): boolean {
+  return compareAsdVersions(version, MIN_ASD_VERSION) >= 0;
+}
+
+/** Fails fast with an actionable message when the runtime is too old. */
+export function assertSupportedAsdVersion(version: string = ASD_VERSION): void {
+  if (!isSupportedAsdVersion(version)) {
+    throw new Error(
+      `Unsupported agent-swarm-director runtime "${version}": ` +
+        `ASD-Nexus requires >= ${MIN_ASD_VERSION}. ` +
+        `Update the agent-swarm-director dependency.`
+    );
   }
 }

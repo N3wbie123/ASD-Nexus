@@ -4,7 +4,7 @@ import {
   SIDECAR_READY_PROTOCOL,
   type SidecarReadyInfo,
 } from "../shared/protocol.ts";
-import { ASD_VERSION } from "./sdk.ts";
+import { assertSupportedAsdVersion, ASD_VERSION } from "./sdk.ts";
 
 export interface ParsedCliArgs {
   port: number;
@@ -52,6 +52,7 @@ export function parseCliArgs(args: string[]): ParsedCliArgs {
 }
 
 export function startSidecar(cliArgs: string[] = process.argv.slice(2)) {
+  assertSupportedAsdVersion();
   const { port, host, projectRoot, home, token } = parseCliArgs(cliArgs);
 
   const server = createOrchestratorApp(undefined, {

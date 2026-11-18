@@ -1644,7 +1644,10 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         assert.equal(healthRes.status, 200);
         const healthData = (await healthRes.json()) as GetHealthResponse;
         assert.equal(healthData.ok, true);
-        assert.equal(healthData.version, "2.6.0");
+        assert.ok(
+          sdk.isSupportedAsdVersion(healthData.version),
+          `health version ${healthData.version} must be >= ${sdk.MIN_ASD_VERSION}`
+        );
         assert.equal(healthData.pid, proc.pid);
 
         // Clean exit: close stdin (EOF)

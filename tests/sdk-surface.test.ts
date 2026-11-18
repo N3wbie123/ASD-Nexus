@@ -4,8 +4,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   ASD_VERSION,
+  MIN_ASD_VERSION,
+  assertSupportedAsdVersion,
   buildResumeCommand,
   buildSpawnSpec,
+  compareAsdVersions,
+  isSupportedAsdVersion,
   withReadOnlyProjectDb,
 } from "../src/server/sdk.ts";
 import type { SqliteDriver } from "../src/server/sdk.ts";
@@ -27,13 +31,36 @@ function getAllSourceFiles(dir: string): string[] {
 
 const srcDir = path.resolve(import.meta.dirname, "../src");
 
-describe("ASD v2.6.0 SDK Surface & Boundary Contract", () => {
-  it("verifies live link to ASD v2.6.0 runtime", () => {
-    assert.equal(
-      ASD_VERSION,
-      "2.6.0",
-      "ASD_VERSION must be 2.6.0 matching the live asd-runtime dependency"
+describe("ASD v2.6.0+ SDK Surface & Boundary Contract", () => {
+  it("verifies the live runtime meets the v2.6.0 baseline", () => {
+    assert.ok(
+      compareAsdVersions(ASD_VERSION, MIN_ASD_VERSION) >= 0,
+      `ASD_VERSION ${ASD_VERSION} must be >= ${MIN_ASD_VERSION}`
     );
+    assert.doesNotThrow(() => assertSupportedAsdVersion(ASD_VERSION));
+  });
+
+  describe("runtime version gate", () => {
+    it("accepts 2.6.0 and every newer version", () => {
+      for (const version of ["2.6.0", "2.6.1", "2.7.0", "2.10.3", "3.0.0"]) {
+        assert.equal(isSupportedAsdVersion(version), true, version);
+      }
+    });
+
+    it("compares version numbers numerically, not lexically", () => {
+      assert.ok(compareAsdVersions("2.10.0", "2.9.0") > 0);
+      assert.equal(compareAsdVersions("2.6.0", "2.6.0"), 0);
+    });
+
+    it("rejects runtimes older than 2.6.0", () => {
+      for (const version of ["2.5.9", "2.5.0", "1.99.99"]) {
+        assert.equal(isSupportedAsdVersion(version), false, version);
+      }
+      assert.throws(
+        () => assertSupportedAsdVersion("2.5.9"),
+        /requires >= 2\.6\.0/
+      );
+    });
   });
 
   describe("SDK_SURFACE_CLEANUP_PLAN §3 cleanliness audits", () => {
@@ -71,7 +98,7 @@ describe("ASD v2.6.0 SDK Surface & Boundary Contract", () => {
       }
     });
 
-    it("verifies zero references to removed v2.6.0 symbols", () => {
+    it("verifies zero references to removed SDK symbols", () => {
       const removedSymbols = [
         "installGlobalConfigs",
         "syncRepoVersionStrings",
