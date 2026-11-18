@@ -605,6 +605,31 @@ fn auto_approve_toggle_and_permission_modal_flow() {
         _ => false,
     });
     assert!(sent_perm, "respond_to_permission must dispatch Request::SubmitTurnPermission");
+
+    // 4. Toggling auto_approve=false in new_session_draft passes auto_approve: Some(false) on first send_prompt()
+    app.start_new_session_draft();
+    app.chat.turn_seq = None;
+    app.backend.submitted.clear();
+    app.set_auto_approve(false);
+    assert!(!app.chat.auto_approve);
+    assert!(
+        !app.backend.submitted.iter().any(|r| matches!(r, Request::SetSessionAutoApprove(_))),
+        "toggling auto_approve in draft must not emit SetSessionAutoApprove"
+    );
+    app.backend.set_client(Some(NexusClient::new("http://127.0.0.1:9", None)));
+    app.backend.submitted.clear();
+    app.chat.composer = "first draft turn with manual approval".into();
+    app.send_prompt();
+    let draft_turn_has_manual_approve = app.backend.submitted.iter().any(|r| match r {
+        Request::StartTurn { req, auto_approve } => {
+            req.session_id.is_none() && *auto_approve == Some(false)
+        }
+        _ => false,
+    });
+    assert!(
+        draft_turn_has_manual_approve,
+        "first send_prompt() in draft with auto_approve=false must submit Request::StartTurn with auto_approve=Some(false)"
+    );
 }
 
 #[test]
@@ -769,13 +794,45 @@ fn copy_resume_command_uses_clipboard() {
 fn session_selection_and_project_switch_reset_state() {
     let mut app = NexusApp::new("C:/p", RunOptions::default());
     populate(&mut app);
-    app.select_session(1);
-    assert_eq!(app.chat.harness(), "codex");
-    assert!(app.active_session_id.is_none(), "unpromoted CLI session has no ASD id");
     app.select_session(0);
     assert_eq!(app.chat.harness(), "claude-code");
     assert_eq!(app.active_session_id.as_deref(), Some("asd-1"));
     assert_eq!(app.chat.picker.selected.as_deref(), Some("sonnet"));
+
+    // Switching to an unpromoted CLI session with model=None must clear stale model & keep active_session_id=None
+    app.select_session(1);
+    assert_eq!(app.chat.harness(), "codex");
+    assert!(app.active_session_id.is_none(), "unpromoted CLI session has no ASD id");
+    assert!(app.selected_session.is_some());
+    assert!(app.chat.picker.selected.is_none(), "switching to default-model session must clear previous model");
+
+    // Reply::Sessions arriving while an unpromoted CLI session is selected must NOT hijack active_session_id
+    let sessions_copy = app.sessions.clone();
+    app.handle_reply(Reply::Sessions(Ok(GetSessionsResponse {
+        sessions: sessions_copy,
+        active_session_id: Some("asd-1".into()),
+    })));
+    assert!(
+        app.active_session_id.is_none(),
+        "Reply::Sessions must not overwrite active_session_id when an unpromoted CLI session is selected"
+    );
+
+    // Sending a prompt on the unpromoted CLI session passes its harness_session_id and explicit "default" reset
+    app.chat.turn_seq = None;
+    app.backend.set_client(Some(NexusClient::new("http://127.0.0.1:9", None)));
+    app.backend.submitted.clear();
+    app.chat.composer = "resume unpromoted cli".into();
+    app.send_prompt();
+    let sent_unpromoted = app.backend.submitted.iter().any(|r| match r {
+        Request::StartTurn { req, .. } => {
+            req.session_id.as_deref() == Some("cx-222")
+                && req.harness == "codex"
+                && req.model.as_deref() == Some("default")
+        }
+        _ => false,
+    });
+    assert!(sent_unpromoted, "send_prompt on unpromoted CLI session must pass harness_session_id and model='default'");
+    app.backend.set_client(None);
 
     app.chat.turn_seq = None;
     app.switch_project("C:/other".into());

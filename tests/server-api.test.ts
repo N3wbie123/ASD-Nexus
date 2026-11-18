@@ -983,16 +983,26 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
       }
     });
 
-    it("enforces server-side harness immutability while allowing same-harness model updates", async () => {
+    it("enforces server-side harness immutability while allowing same-harness model updates and default reset", async () => {
       const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-immutable-proj-"));
       const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-immutable-home-"));
       const seenModels: Array<string | null> = [];
+      const seenInputModels: Array<string | undefined> = [];
 
       const { baseUrl, close } = await startTestServer(
         {
           runDriverTurn: async (input) => {
             const active = input.db.getActiveDriver(input.sessionId);
             seenModels.push(active?.model ?? null);
+            seenInputModels.push(input.model);
+            sdk.attachDriver(input.db, {
+              projectRoot: input.projectRoot,
+              sessionId: input.sessionId,
+              harness: active?.harness || "claude-code",
+              model: active?.model ?? null,
+              harnessSessionId: "cl-sid-immutable-1",
+              source: "user",
+            });
             input.onEvent?.({
               type: "text",
               harness: active?.harness || "claude-code",
@@ -1047,6 +1057,17 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         assert.equal(t2Rejected.at(-1)?.kind, "status");
         assert.equal(t2Rejected.at(-1)?.status, "interrupted");
 
+        // Attempt Turn 2 using raw native CLI sessionId on a different harness -> also rejected with HARNESS_IMMUTABLE
+        const t2RawRejected = await collectTurnEvents({
+          projectRoot: tmpProject,
+          sessionId: "cl-sid-immutable-1",
+          harness: "codex",
+          prompt: "Illegal cross-harness raw sid",
+        });
+        const rawErrEvt = t2RawRejected.find((e) => e.kind === "error");
+        assert.ok(rawErrEvt?.error?.includes("HARNESS_IMMUTABLE"));
+        assert.equal(t2RawRejected.at(-1)?.status, "interrupted");
+
         // Verify active driver in SQLite was NOT switched to codex
         sdk.withReadOnlyProjectDb(
           tmpProject,
@@ -1054,6 +1075,7 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
             const active = db.getActiveDriver(asdSessionId);
             assert.equal(active?.harness, "claude-code");
             assert.equal(active?.model, "claude-sonnet-4-6");
+            assert.equal(db.listSessions().length, 1);
           },
           tmpHome
         );
@@ -1068,7 +1090,30 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         });
         assert.ok(t2Allowed.some((e) => e.kind === "text" && e.text === "Model=claude-opus-4-6"));
         assert.equal(t2Allowed.at(-1)?.status, "done");
-        assert.deepEqual(seenModels, ["claude-sonnet-4-6", "claude-opus-4-6"]);
+
+        // Turn 3 with explicit "default" resets driver & session model to null (and passes undefined to runDriverTurn)
+        const t3Reset = await collectTurnEvents({
+          projectRoot: tmpProject,
+          sessionId: asdSessionId,
+          harness: "claude-code",
+          model: "default",
+          prompt: "Reset to default model",
+        });
+        assert.ok(t3Reset.some((e) => e.kind === "text" && e.text === "Model=default"));
+        assert.equal(t3Reset.at(-1)?.status, "done");
+        assert.deepEqual(seenModels, ["claude-sonnet-4-6", "claude-opus-4-6", null]);
+        assert.deepEqual(seenInputModels, ["claude-sonnet-4-6", "claude-opus-4-6", undefined]);
+
+        sdk.withReadOnlyProjectDb(
+          tmpProject,
+          (db) => {
+            const active = db.getActiveDriver(asdSessionId);
+            assert.equal(active?.harness, "claude-code");
+            assert.equal(active?.model ?? null, null);
+            assert.equal(active?.harness_session_id, "cl-sid-immutable-1");
+          },
+          tmpHome
+        );
       } finally {
         await close();
         fs.rmSync(tmpProject, { recursive: true, force: true });
@@ -1220,6 +1265,117 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         assert.equal(events.at(-1)?.status, "done");
 
         // Verify allow_always persisted auto_approve = 1 in SQLite
+        sdk.withReadOnlyProjectDb(
+          tmpProject,
+          (db) => {
+            const row = db.getSession(createData.sessionId);
+            assert.equal(row?.auto_approve, 1);
+          },
+          tmpHome
+        );
+      } finally {
+        await close();
+        fs.rmSync(tmpProject, { recursive: true, force: true });
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("POST /api/turn/permission persists autoApprove=true for fallback optionId='allow_always' when options is empty", async () => {
+      const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-perm-empty-proj-"));
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-perm-empty-home-"));
+      const permissionResults: unknown[] = [];
+
+      const { baseUrl, close } = await startTestServer(
+        {
+          runDriverTurn: async (input) => {
+            const firstDecision = await input.onPermissionRequest({
+              toolCall: { title: "Edit file", kind: "edit" },
+              options: [],
+            });
+            permissionResults.push(firstDecision);
+
+            const secondDecision = await input.onPermissionRequest({
+              toolCall: { title: "Second action", kind: "execute" },
+              options: [
+                { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+              ],
+            });
+            permissionResults.push(secondDecision);
+            return { exitCode: 0 } as any;
+          },
+        },
+        { defaultProjectRoot: tmpProject, homeDir: tmpHome }
+      );
+
+      try {
+        const createRes = await fetch(`${baseUrl}/api/sessions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            projectRoot: tmpProject,
+            harness: "claude-code",
+            autoApprove: false,
+          }),
+        });
+        const createData = (await createRes.json()) as CreateSessionResponse;
+        assert.equal(createData.success, true);
+
+        let permEvt: OrchestratorEvent | undefined;
+        const streamPromise = (async () => {
+          const res = await fetch(`${baseUrl}/api/turn/stream`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+            body: JSON.stringify({
+              projectRoot: tmpProject,
+              sessionId: createData.sessionId,
+              harness: "claude-code",
+              prompt: "Empty options test",
+            }),
+          });
+          const reader = res.body!.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const parts = buf.split("\n\n");
+            buf = parts.pop() || "";
+            for (const p of parts) {
+              const line = p.trim();
+              if (line.startsWith("data: ")) {
+                const evt = JSON.parse(line.slice(6)) as OrchestratorEvent;
+                if (evt.kind === "permission_request") permEvt = evt;
+              }
+            }
+          }
+        })();
+
+        while (!permEvt) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+
+        const decisionRes = await fetch(`${baseUrl}/api/turn/permission`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            turnId: permEvt.turnId,
+            requestId: permEvt.permissionRequest?.requestId,
+            outcome: "selected",
+            optionId: "allow_always",
+          }),
+        });
+        assert.equal(decisionRes.status, 200);
+        const decisionData = (await decisionRes.json()) as TurnPermissionDecisionResponse;
+        assert.equal(decisionData.success, true);
+
+        await streamPromise;
+
+        assert.deepEqual(permissionResults, [
+          { outcome: { outcome: "selected", optionId: "allow_always" } },
+          { outcome: { outcome: "selected", optionId: "allow_once" } },
+        ]);
+
         sdk.withReadOnlyProjectDb(
           tmpProject,
           (db) => {

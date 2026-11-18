@@ -964,3 +964,73 @@ fn help_and_quit() {
     a.handle_key(ctrl('q'));
     assert!(a.should_quit);
 }
+
+#[test]
+fn critic_remediation_unpromoted_session_new_cancel_and_permission_interrupt() {
+    let mut a = app();
+    // 1. Unpromoted CLI session with model=None clears stale model and does NOT leak foreground_id
+    a.model = Some("claude-opus-4".into());
+    a.open_overlay(Overlay::Sessions);
+    a.take_actions();
+    a.handle_key(key(KeyCode::Down)); // select cx-1 (unpromoted, model=None)
+    a.handle_key(key(KeyCode::Enter));
+    assert!(a.current.is_some());
+    assert!(a.current_asd.is_none());
+    assert_eq!(a.harness, "codex");
+    assert!(a.model.is_none(), "opening session with model=None must clear previous model");
+    assert_eq!(
+        a.active_session_id(),
+        None,
+        "unpromoted CLI session must not fall back to foreground_id"
+    );
+    let actions = a.take_actions();
+    assert!(matches!(actions.as_slice(), [Action::OpenSession(_)]));
+
+    // 2. `/new` while streaming cancels active stream and clears stream/streaming state
+    a.timeline.begin_turn("running prompt");
+    let (_tx, rx) = mpsc::channel();
+    a.stream = Some(asd_nexus_cli::app::ActiveStream { handle: None, rx });
+    assert!(a.is_streaming());
+    type_str(&mut a, "/new");
+    a.handle_key(key(KeyCode::Enter));
+    assert!(a.stream.is_none(), "/new must drop old ActiveStream");
+    assert!(!a.is_streaming(), "/new must clear streaming state");
+    assert_eq!(a.take_actions(), vec![Action::CancelTurn]);
+
+    // 3. Ctrl+X during open permission modal clears pending_permissions and cancels active turn
+    a.timeline.begin_turn("perm turn");
+    let (tx2, rx2) = mpsc::channel();
+    a.stream = Some(asd_nexus_cli::app::ActiveStream { handle: None, rx: rx2 });
+    a.pending_permissions.push_back((
+        "turn-ctrlx".into(),
+        PermissionRequestPayload {
+            request_id: "req-ctrlx".into(),
+            tool_name: "Bash".into(),
+            ..Default::default()
+        },
+    ));
+    a.handle_key(ctrl('x'));
+    assert!(a.pending_permissions.is_empty(), "Ctrl+X must clear pending_permissions");
+    assert_eq!(a.take_actions(), vec![Action::CancelTurn]);
+
+    // 4. pending_permissions clears automatically when stream finishes / interrupts
+    a.pending_permissions.push_back((
+        "turn-done".into(),
+        PermissionRequestPayload {
+            request_id: "req-done".into(),
+            tool_name: "Edit".into(),
+            ..Default::default()
+        },
+    ));
+    let mut p = SseParser::new();
+    for m in p.feed(b"data: {\"kind\":\"status\",\"status\":\"interrupted\"}\n\n") {
+        tx2.send(m).unwrap();
+    }
+    a.drain_stream();
+    assert!(!a.is_streaming());
+    assert!(a.stream.is_none());
+    assert!(
+        a.pending_permissions.is_empty(),
+        "drain_stream on interrupted/done must clear stale pending_permissions"
+    );
+}

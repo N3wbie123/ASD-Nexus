@@ -237,7 +237,6 @@ pub fn execute(c: &NexusClient, req: Request, tx: &Sender<Reply>, seq: u64) -> O
                 }) {
                     Ok(created) if created.success => {
                         req.session_id = Some(created.session_id.clone());
-                        let _ = tx.send(Reply::CreateSession(Ok(created)));
                     }
                     Ok(created) => {
                         let msg = created.error.unwrap_or_else(|| "create session failed".into());

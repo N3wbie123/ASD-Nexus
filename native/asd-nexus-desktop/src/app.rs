@@ -529,9 +529,7 @@ impl NexusApp {
                 self.refresh_harness_commands();
             }
         }
-        if s.model.is_some() {
-            self.chat.picker.selected = s.model.clone();
-        }
+        self.chat.picker.selected = s.model.clone();
         self.terminal.resume = None;
         if !self.chat.is_streaming() {
             self.chat.timeline.clear();
@@ -837,14 +835,23 @@ impl NexusApp {
         }
         let session_id = if self.chat.new_session_draft {
             None
+        } else if let Some(ref sid) = self.active_session_id {
+            Some(sid.clone())
+        } else if let Some((_, ref h_sid)) = self.selected_session {
+            Some(h_sid.clone())
         } else {
-            self.active_session_id.clone()
+            None
+        };
+        let model = if self.is_session_started() && self.chat.picker.selected.is_none() {
+            Some("default".into())
+        } else {
+            self.chat.picker.selected.clone()
         };
         let req = TurnStreamRequest {
             project_root: self.root_opt(),
             session_id,
             harness: self.chat.harness().to_string(),
-            model: self.chat.picker.selected.clone(),
+            model,
             prompt: prompt.clone(),
             source: Some("desktop".into()),
             streaming: Some(true),
@@ -1032,7 +1039,10 @@ impl NexusApp {
             Reply::Sessions(r) => match r {
                 Ok(s) => {
                     self.sessions = s.sessions;
-                    if self.active_session_id.is_none() && !self.chat.new_session_draft {
+                    if self.active_session_id.is_none()
+                        && !self.chat.new_session_draft
+                        && self.selected_session.is_none()
+                    {
                         self.active_session_id = s.active_session_id;
                     }
                 }

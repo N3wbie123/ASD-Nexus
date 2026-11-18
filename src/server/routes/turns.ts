@@ -165,6 +165,7 @@ interface PreparedTurnContext {
   db: SqliteDriver;
   asdSessionId: string;
   harness: HarnessId;
+  model: string | null;
   initialHarnessSessionId?: string;
   autoApprove: boolean;
   projectRoot: string;
@@ -178,7 +179,13 @@ function prepareTurnSessionAndDriver(
   const db = ctx.deps.openProjectDb(projectRoot, ctx.homeDir);
   try {
     const requestedHarness = (body.harness || "claude-code") as HarnessId;
-    const requestedModel = body.model?.trim() ? body.model.trim() : undefined;
+    const hasModelParam = body.model !== undefined;
+    const trimmedModel = typeof body.model === "string" ? body.model.trim() : "";
+    const isExplicitModelReset =
+      hasModelParam &&
+      (trimmedModel === "" || trimmedModel.toLowerCase() === "default");
+    const requestedModel =
+      hasModelParam && !isExplicitModelReset ? trimmedModel : undefined;
     const rawSid = (body.sessionId || "").trim();
     const source = body.source || "user";
 
@@ -190,7 +197,7 @@ function prepareTurnSessionAndDriver(
         sessionId: asdSessionId,
         projectRoot,
         mainHarness: requestedHarness,
-        mainModel: requestedModel ?? null,
+        mainModel: isExplicitModelReset ? null : (requestedModel ?? null),
         memo: "",
       });
     } else if ((existingSessionRow = db.getSession(rawSid))) {
@@ -201,7 +208,7 @@ function prepareTurnSessionAndDriver(
         sessionId: asdSessionId,
         projectRoot,
         mainHarness: requestedHarness,
-        mainModel: requestedModel ?? null,
+        mainModel: isExplicitModelReset ? null : (requestedModel ?? null),
         memo: "",
       });
     } else {
@@ -210,31 +217,56 @@ function prepareTurnSessionAndDriver(
         asdSessionId = mapped.session_id;
         existingSessionRow = mapped;
       } else {
-        try {
-          const promoted = ctx.deps.promoteCliSessionToAsd({
-            db,
-            projectRoot,
-            harness: requestedHarness,
-            harnessSessionId: rawSid,
-            model: requestedModel,
-            source,
-            homeDir: ctx.homeDir,
-          });
-          asdSessionId = promoted.sessionId;
-          if (!promoted.created) {
-            existingSessionRow = db.getSession(asdSessionId) ?? null;
+        const crossHarness =
+          db
+            .listSessions?.()
+            ?.find(
+              (s) =>
+                s.harness_session_id === rawSid &&
+                Boolean(s.main_harness) &&
+                s.main_harness !== requestedHarness
+            ) ?? db.findSessionByHarnessSessionId?.(rawSid);
+        const requestedTrimmed = body.harness?.trim();
+        if (
+          crossHarness &&
+          crossHarness.main_harness &&
+          requestedTrimmed &&
+          requestedTrimmed !== crossHarness.main_harness
+        ) {
+          throw new Error(
+            `HARNESS_IMMUTABLE: Session ${crossHarness.session_id} (harnessSessionId=${rawSid}) is locked to harness '${crossHarness.main_harness}' and cannot switch to '${requestedTrimmed}'`
+          );
+        }
+        if (crossHarness && !requestedTrimmed) {
+          asdSessionId = crossHarness.session_id;
+          existingSessionRow = crossHarness;
+        } else {
+          try {
+            const promoted = ctx.deps.promoteCliSessionToAsd({
+              db,
+              projectRoot,
+              harness: requestedHarness,
+              harnessSessionId: rawSid,
+              model: requestedModel,
+              source,
+              homeDir: ctx.homeDir,
+            });
+            asdSessionId = promoted.sessionId;
+            if (!promoted.created) {
+              existingSessionRow = db.getSession(asdSessionId) ?? null;
+            }
+          } catch {
+            asdSessionId = ctx.deps.isValidAsdSessionId(rawSid)
+              ? rawSid
+              : ctx.deps.generateAsdSessionId();
+            db.createOrGetSession({
+              sessionId: asdSessionId,
+              projectRoot,
+              mainHarness: requestedHarness,
+              mainModel: isExplicitModelReset ? null : (requestedModel ?? null),
+              memo: "",
+            });
           }
-        } catch {
-          asdSessionId = ctx.deps.isValidAsdSessionId(rawSid)
-            ? rawSid
-            : ctx.deps.generateAsdSessionId();
-          db.createOrGetSession({
-            sessionId: asdSessionId,
-            projectRoot,
-            mainHarness: requestedHarness,
-            mainModel: requestedModel ?? null,
-            memo: "",
-          });
         }
       }
     }
@@ -261,11 +293,18 @@ function prepareTurnSessionAndDriver(
     let initialHarnessSessionId =
       active?.harness_session_id ?? existingSessionRow?.harness_session_id ?? undefined;
 
-    if (
-      !active ||
-      active.harness !== effectiveHarness ||
-      (requestedModel !== undefined && requestedModel !== (active.model ?? undefined))
-    ) {
+    const currentModel =
+      (active?.harness === effectiveHarness ? active.model : undefined) ??
+      existingSessionRow?.main_model ??
+      null;
+    const effectiveModel: string | null = isExplicitModelReset
+      ? null
+      : requestedModel ?? currentModel;
+    const modelChanged = isExplicitModelReset
+      ? (active?.model ?? null) !== null
+      : requestedModel !== undefined && requestedModel !== (active?.model ?? undefined);
+
+    if (!active || active.harness !== effectiveHarness || modelChanged) {
       const preservedHarnessSessionId =
         active && active.harness === effectiveHarness
           ? active.harness_session_id ?? existingSessionRow?.harness_session_id ?? null
@@ -276,11 +315,7 @@ function prepareTurnSessionAndDriver(
         projectRoot,
         sessionId: asdSessionId,
         harness: effectiveHarness,
-        model:
-          requestedModel ??
-          (active?.harness === effectiveHarness ? active.model : undefined) ??
-          existingSessionRow?.main_model ??
-          null,
+        model: effectiveModel,
         harnessSessionId: preservedHarnessSessionId,
         source,
       });
@@ -299,6 +334,7 @@ function prepareTurnSessionAndDriver(
       db,
       asdSessionId,
       harness: effectiveHarness,
+      model: effectiveModel,
       initialHarnessSessionId,
       autoApprove,
       projectRoot,
@@ -489,7 +525,7 @@ async function executeTurn(
       db: prepared.db,
       sessionId: prepared.asdSessionId,
       prompt: resolvedSlash.prompt,
-      model: body.model,
+      model: prepared.model ?? undefined,
       streamJson: body.streaming ?? true,
       autoApprove: prepared.autoApprove,
       signal: turn.abortController.signal,
@@ -701,7 +737,7 @@ export function turnPermissionRoute(ctx: RequestContext): void {
     }
 
     const chosenOption = pending.options.find((opt) => opt.optionId === optionId);
-    if (chosenOption?.kind === "allow_always") {
+    if (chosenOption?.kind === "allow_always" || optionId === "allow_always") {
       turn.autoApprove = true;
       if (turn.sessionId && turn.projectRoot) {
         try {

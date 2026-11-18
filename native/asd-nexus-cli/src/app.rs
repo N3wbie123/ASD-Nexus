@@ -226,6 +226,7 @@ pub struct App {
     pub auto_approve: bool,
     pub pending_permissions: VecDeque<(String, PermissionRequestPayload)>,
     pub permission_sel: usize,
+    pub pending_cancel_handles: Vec<TurnStreamHandle>,
 
     pub models: std::collections::HashMap<String, Vec<String>>,
     pub picker_harness: usize,
@@ -332,6 +333,7 @@ impl App {
             auto_approve: true,
             pending_permissions: VecDeque::new(),
             permission_sel: 0,
+            pending_cancel_handles: Vec::new(),
             models: Default::default(),
             picker_harness,
             picker_query: String::new(),
@@ -416,7 +418,18 @@ impl App {
             || self.is_streaming()
     }
 
+    pub fn cancel_active_stream(&mut self) {
+        if let Some(mut st) = self.stream.take() {
+            if let Some(h) = st.handle.take() {
+                self.pending_cancel_handles.push(h);
+            }
+            self.push(Action::CancelTurn);
+        }
+        self.timeline.streaming = false;
+    }
+
     pub fn start_new_session_draft(&mut self) {
+        self.cancel_active_stream();
         self.current = None;
         self.current_asd = None;
         self.cli_session = None;
@@ -443,10 +456,13 @@ impl App {
 
     /// ASD session used for board / subagents / turns.
     pub fn active_session_id(&self) -> Option<String> {
-        if let Some(id) = self.current_asd.clone().or_else(|| self.cli_session.clone()) {
-            return Some(id);
+        if let Some(ref id) = self.current_asd {
+            return Some(id.clone());
         }
-        if self.new_session_draft {
+        if let Some(ref id) = self.cli_session {
+            return Some(id.clone());
+        }
+        if self.new_session_draft || self.current.is_some() {
             return None;
         }
         self.foreground_id.clone()
@@ -928,6 +944,16 @@ impl App {
                 self.should_quit = true;
                 return;
             }
+            if ctrl(&k, 'x') {
+                self.pending_permissions.clear();
+                self.permission_sel = 0;
+                if self.is_streaming() {
+                    self.push(Action::CancelTurn);
+                } else {
+                    self.set_status("No active turn");
+                }
+                return;
+            }
             self.handle_permission_key(k);
             return;
         }
@@ -1272,9 +1298,7 @@ impl App {
                 if let Some(s) = sel {
                     // OpenSession adjusts harness to the session's harness without creating a new session!
                     self.harness = s.harness.clone();
-                    if s.model.is_some() {
-                        self.model = s.model.clone();
-                    }
+                    self.model = s.model.clone();
                     self.auto_approve = s.auto_approve.unwrap_or(true);
                     self.new_session_draft = false;
                     self.current_asd = s.asd_session_id.clone();
@@ -1650,6 +1674,7 @@ impl App {
             }
             "new" => {
                 if let Some(title) = arg {
+                    self.cancel_active_stream();
                     self.current = None;
                     self.current_asd = None;
                     self.cli_session = None;

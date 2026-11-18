@@ -108,9 +108,7 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
             };
             app.harness = s.harness.clone();
             app.picker_harness = HARNESSES.iter().position(|h| *h == app.harness).unwrap_or(0);
-            if s.model.is_some() {
-                app.model = s.model.clone();
-            }
+            app.model = s.model.clone();
             app.current_asd = s.asd_session_id.clone();
             app.auto_approve = s.auto_approve.unwrap_or(true);
             app.new_session_draft = false;
@@ -316,8 +314,12 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
             app.execute_shell(&cmd);
         }
         Action::SendPrompt(prompt) => {
+            let started = app.is_session_started();
             app.new_session_draft = false;
             let mut session_id = app.current_asd.clone().or_else(|| app.cli_session.clone());
+            app.timeline.begin_turn(&prompt);
+            app.timeline_sel = app.timeline.entries.len().saturating_sub(1);
+            app.timeline_scroll = None;
             if session_id.is_none() && !app.auto_approve {
                 let create_req = CreateSessionRequest {
                     project_root: root(app),
@@ -327,26 +329,39 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
                     auto_approve: Some(false),
                     ..Default::default()
                 };
-                if let Some(r) = try_(app, "create session", client.create_session(&create_req)) {
-                    if r.success {
+                match try_(app, "create session", client.create_session(&create_req)) {
+                    Some(r) if r.success => {
                         app.current_asd = Some(r.session_id.clone());
                         app.auto_approve = r.auto_approve.unwrap_or(false);
                         session_id = Some(r.session_id);
                     }
+                    Some(r) => {
+                        let msg = r.error.unwrap_or_else(|| "create session failed".into());
+                        app.timeline.push(Entry::new(EntryKind::Error, msg.clone()));
+                        app.set_status(format!("create session: {msg}"));
+                        app.timeline.end_turn(Some("failed to initialize session"));
+                        return;
+                    }
+                    None => {
+                        app.timeline.end_turn(Some("failed to initialize session"));
+                        return;
+                    }
                 }
             }
+            let model = if started && app.model.is_none() {
+                Some("default".into())
+            } else {
+                app.model.clone()
+            };
             let req = TurnStreamRequest {
                 project_root: root(app),
                 session_id,
                 harness: app.harness.clone(),
-                model: app.model.clone(),
+                model,
                 prompt: prompt.clone(),
                 source: Some("asd-nexus-cli".into()),
                 streaming: Some(true),
             };
-            app.timeline.begin_turn(&prompt);
-            app.timeline_sel = app.timeline.entries.len().saturating_sub(1);
-            app.timeline_scroll = None;
             match client.stream_turn(&req) {
                 Ok((handle, rx)) => {
                     app.stream = Some(ActiveStream { handle: Some(handle), rx });
@@ -360,7 +375,11 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
             }
         }
         Action::CancelTurn => {
-            let handle = app.stream.as_mut().and_then(|s| s.handle.take());
+            let handle = app
+                .stream
+                .as_mut()
+                .and_then(|s| s.handle.take())
+                .or_else(|| app.pending_cancel_handles.pop());
             match handle {
                 Some(h) => match h.cancel() {
                     Ok(r) => {
