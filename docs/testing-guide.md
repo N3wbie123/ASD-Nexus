@@ -1,10 +1,11 @@
 # ASD-Nexus Testing & Verification Guide
 
-ASD-Nexus consists of a clean-room Node v2.6.0 HTTP/SSE sidecar server (`src/server/**`) and a native Rust workspace (`native/Cargo.toml`: `asd-nexus-client`, `asd-nexus-cli`, `asd-nexus-desktop`) supporting a Dark Color default palette plus a strict grayscale Monochrome mode toggle.
+ASD-Nexus consists of a clean-room Node HTTP/SSE sidecar server (`src/server/**`) running on the `agent-swarm-director` SDK `>=2.6.0`, and a native Rust workspace (`native/Cargo.toml`: `asd-nexus-client`, `asd-nexus-cli`, `asd-nexus-desktop`) supporting a Dark Color default palette plus a strict grayscale Monochrome mode toggle.
 
 ## 1. Prerequisites
 
 - Node.js `>=22.13.0` (`node:test`, `node:sqlite`, TypeScript strip-types)
+- `agent-swarm-director` `>=2.6.0` (installed from the local `file:` dependency; 2.6.x, 2.7.x and later majors are accepted)
 - Rust toolchain (`cargo` / `rustc` with locked `native/Cargo.lock`)
 - For Live 5-Harness E2E (`tests/live-5harness-e2e.test.ts`):
   - Installed and authenticated CLIs on `PATH`: `claude`, `codex`, `opencode`, `agy`, `agent`
@@ -20,7 +21,7 @@ npm run typecheck
 
 ### Offline Server & Normalizer Tests Only
 
-Runs 5-harness fixture replay, chunk-boundary equivalence, v2.6.0 SDK boundary cleanliness, HTTP/SSE server APIs (`/api/harness-commands`, `/api/fs/list`, etc.), model catalog merging, and `--port 0` sidecar process lifecycle (73 offline tests across 23 suites):
+Runs 5-harness fixture replay, chunk-boundary equivalence, v2.6.0+ SDK boundary cleanliness, HTTP/SSE server APIs (`/api/harness-commands`, `/api/fs/list`, etc.), model catalog merging, and `--port 0` sidecar process lifecycle (76 offline tests across 24 suites):
 
 ```bash
 node --no-warnings --test tests/normalizer-replay.test.ts tests/sdk-surface.test.ts tests/server-api.test.ts tests/model-catalog.test.ts

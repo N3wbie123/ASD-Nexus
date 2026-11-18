@@ -2,7 +2,7 @@
 
 이 문서는 ASD-Nexus를 직접 실행해서 확인하는 방법을 순서대로 정리한 것입니다.  
 영문판은 `docs/testing-guide.md`에 있습니다.  
-기준 환경: Windows 10/11 + PowerShell 5.1, Node.js 22.13+, Rust stable.  
+기준 환경: Windows 10/11 + PowerShell 5.1, Node.js 22.13+, Rust stable, `agent-swarm-director` 2.6.0+ (2.7.0에서 검증).  
 모든 명령은 ASD-Nexus 프로젝트 루트에서 실행합니다.
 
 ```powershell
@@ -82,7 +82,7 @@ npm run typecheck
 
 기대: 출력 마지막에 에러 없이 종료(exit code 0).
 
-### 1-2. Node 오프라인 테스트 73개
+### 1-2. Node 오프라인 테스트 76개
 
 ```powershell
 node --no-warnings --test tests/normalizer-replay.test.ts tests/sdk-surface.test.ts tests/server-api.test.ts tests/model-catalog.test.ts
@@ -91,10 +91,10 @@ node --no-warnings --test tests/normalizer-replay.test.ts tests/sdk-surface.test
 기대:
 
 ```text
-tests 73
-pass 73
+tests 76
+pass 76
 fail 0
-duration_ms 약 1,260
+duration_ms 약 1,460
 ```
 
 ### 1-3. Rust 워크스페이스 테스트 80개
@@ -126,8 +126,10 @@ node --no-warnings src/server/index.ts --port 3847 --project-root .
 기대: 아래 형태의 JSON 한 줄이 출력되고 서버가 계속 떠 있음.
 
 ```json
-{"protocol":"asd-nexus-sidecar","protocolVersion":1,"pid":12345,"host":"127.0.0.1","port":3847,"baseUrl":"http://127.0.0.1:3847","projectRoot":".","version":"2.6.0","tokenRequired":false,"startedAt":"..."}
+{"protocol":"asd-nexus-sidecar","protocolVersion":1,"pid":12345,"host":"127.0.0.1","port":3847,"baseUrl":"http://127.0.0.1:3847","projectRoot":".","version":"2.7.0","tokenRequired":false,"startedAt":"..."}
 ```
+
+`version`은 설치된 `agent-swarm-director` 런타임 버전이며, 2.6.0 이상이면 됩니다.
 
 이제 **또 다른 PowerShell 창**에서 아래 API를 확인합니다.
 
@@ -145,7 +147,7 @@ curl.exe -s "$base/api/health"
 기대:
 
 ```json
-{"ok":true,"version":"2.6.0","defaultProjectRoot":".","pid":12345}
+{"ok":true,"version":"2.7.0","defaultProjectRoot":".","pid":12345}
 ```
 
 ### 2-3. 프로젝트 / 모델 / 라우팅
@@ -328,7 +330,7 @@ cargo build --release --manifest-path native/Cargo.toml --locked
 
 기대:
 
-- `health --json`: `{"ok":true,"version":"2.6.0",...}`
+- `health --json`: `{"ok":true,"version":"2.7.0",...}`
 - `sessions --json`: 세션 배열
 - `board --json`: 진행 보드 JSON(포그라운드 세션/태스크에 따라 내용이 달라짐)
 
@@ -510,7 +512,7 @@ cargo build --release --manifest-path native/Cargo.toml --locked
 | 단계 | 기대 결과 |
 |---|---|
 | `npm run typecheck` | exit 0 |
-| `npm test` | Node 78/78 (오프라인 73 + 라이브 5) |
+| `npm test` | Node 81/81 (오프라인 76 + 라이브 5) |
 | `cargo test ... --locked` | Rust 80/80 |
 | `cargo build --release ... --locked` | exit 0, `asd-nexus-cli.exe` / `asd-nexus-desktop.exe` 생성 |
 
@@ -536,7 +538,7 @@ cargo build --release --manifest-path native/Cargo.toml --locked
 ## 8. 최종 체크리스트
 
 - [ ] `npm run typecheck` exit 0
-- [ ] Node 오프라인 73/73
+- [ ] Node 오프라인 76/76
 - [ ] 라이브 5하네스 5/5 (claude-code `haiku`, opencode free 모델)
 - [ ] Rust 80/80
 - [ ] `cargo build --release --locked` 성공
