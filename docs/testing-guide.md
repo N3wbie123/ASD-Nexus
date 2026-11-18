@@ -1,6 +1,6 @@
 # ASD-Nexus Testing & Verification Guide
 
-ASD-Nexus consists of a clean-room Node v2.6.0 HTTP/SSE sidecar server (`src/server/**`) and a monochrome native Rust workspace (`native/Cargo.toml`: `asd-nexus-client`, `asd-nexus-cli`, `asd-nexus-desktop`).
+ASD-Nexus consists of a clean-room Node v2.6.0 HTTP/SSE sidecar server (`src/server/**`) and a native Rust workspace (`native/Cargo.toml`: `asd-nexus-client`, `asd-nexus-cli`, `asd-nexus-desktop`) supporting a Dark Color default palette plus a strict grayscale Monochrome mode toggle.
 
 ## 1. Prerequisites
 
@@ -20,10 +20,10 @@ npm run typecheck
 
 ### Offline Server & Normalizer Tests Only
 
-Runs 5-harness fixture replay, chunk-boundary equivalence, v2.6.0 SDK boundary cleanliness, HTTP/SSE server APIs, and `--port 0` sidecar process lifecycle:
+Runs 5-harness fixture replay, chunk-boundary equivalence, v2.6.0 SDK boundary cleanliness, HTTP/SSE server APIs (`/api/harness-commands`, `/api/fs/list`, etc.), model catalog merging, and `--port 0` sidecar process lifecycle (73 offline tests across 23 suites):
 
 ```bash
-node --no-warnings --test tests/normalizer-replay.test.ts tests/sdk-surface.test.ts tests/server-api.test.ts
+node --no-warnings --test tests/normalizer-replay.test.ts tests/sdk-surface.test.ts tests/server-api.test.ts tests/model-catalog.test.ts
 ```
 
 ### Live 5-Harness CLI E2E Suite
@@ -53,7 +53,7 @@ npm test
 
 ### Locked Workspace Tests (`asd-nexus-client`, `asd-nexus-cli`, `asd-nexus-desktop`)
 
-Includes `ratatui` TUI `TestBackend` monochrome rendering tests, `egui` headless tab grayscale pixel verification, Korean font fallback tests, CLI arg checks, and live `--port 0` sidecar spawn/shutdown verification:
+Includes OpenCode-style `ratatui` TUI `TestBackend` rendering/slash/`@`/`!`/mouse/palette tests, `egui` headless `Chat`/`Dashboard` separation, `/` & `@` popup completion, strict grayscale `Monochrome` + `DarkColor` vertex verification, Korean font fallback tests, CLI arg checks, and live `--port 0` sidecar spawn/shutdown verification (80 Rust tests total):
 
 ```bash
 cargo test --manifest-path native/Cargo.toml --workspace --locked
@@ -79,12 +79,13 @@ Auto-spawns the Node sidecar with `--port 0`, connects over HTTP, loads Korean f
 ./native/target/release/asd-nexus-desktop.exe --verify --project-root .
 ```
 
-### Desktop Real Window Screenshot Capture
+### Desktop Real Window Screenshot Capture (Dark Color & Monochrome)
 
-Captures a 24-bit BMP screenshot (convertible to PNG for inspection/archival) and exits cleanly:
+Captures a 24-bit BMP screenshot (convertible to PNG for inspection/archival) and exits cleanly. Pass `--theme dark` (default) or `--theme mono`:
 
 ```bash
-./native/target/release/asd-nexus-desktop.exe --project-root . --screenshot docs/evidence/desktop-monochrome.bmp --exit-after 4
+./native/target/release/asd-nexus-desktop.exe --project-root . --screenshot docs/evidence/desktop-dark.bmp --exit-after 4
+./native/target/release/asd-nexus-desktop.exe --project-root . --theme mono --screenshot docs/evidence/desktop-monochrome.bmp --exit-after 4
 ```
 
 ### CLI Scriptable Mode Smoke Check

@@ -1,66 +1,46 @@
 # ASD-Nexus Clean-Room Verification Report
 
-**Session:** `asd-20261113-122445-z8e9`  
-**Task:** `T6.1` — 5-harness live CLI E2E verification, Rust release build, and desktop UI capture  
-**Timestamp (UTC):** `2026-11-13T13:51:20Z`  
-**E2E evidence:** `docs/evidence/e2e-5harness-summary.json` (generated `2026-11-13T13:50:09.420Z`)
+**Session:** `asd-20261114-173800-ux01`  
+**Task:** `T3.1` — Full TS + Rust verification gate, release build, dual-theme desktop Dark/Mono captures, and CLI smoke tests  
+**Timestamp (UTC):** `2026-11-14T09:35:50Z`  
+**Prior Live E2E Evidence:** `docs/evidence/e2e-5harness-summary.json` (generated `2026-11-13T16:12:11.152Z`, 5/5 harnesses passed; live external LLM suite was not re-run in this offline/UI pass)
 
-## 1. Architecture Verified
+## 1. Architecture & UX Verified
 
-- **Node v2.6.0 HTTP/SSE Sidecar (`src/server/`)**: Zero `child_process` imports in `src/`, zero removed WebView/Vite artifacts, clean `--port 0` JSON readiness handshake (`SIDECAR_READY_PROTOCOL = "asd-nexus-sidecar"`), and clean shutdown on stdin EOF.
-- **Rust Workspace (`native/Cargo.toml`)**: Zero WebView crates (`wry`/`tauri`); shared synchronous client (`asd-nexus-client`), pure monochrome terminal TUI/CLI (`asd-nexus-cli` using `ratatui`/`crossterm`), and pure monochrome native OS window (`asd-nexus-desktop` using `eframe`/`egui` + `rfd`).
+- **Node v2.6.0 HTTP/SSE Sidecar (`src/server/`)**: Zero `child_process` imports in `src/`, `--port 0` JSON readiness handshake, clean stdin EOF shutdown, plus `GET /api/harness-commands` (`src/server/routes/commands.ts` for all 5 harnesses' builtin + global/project `.md` commands/skills), `GET /api/fs/list` (`src/server/routes/fs.ts` for `@` files & `/cd` dirs), and custom slash command expansion in `src/server/routes/turns.ts`.
+- **CLI / TUI (`native/asd-nexus-cli`)**: OpenCode-inspired borderless TUI with Home & Active timeline views, collapsible `/sidebar` drawer, `DarkColor` default + strict grayscale `Monochrome` `/theme` toggle, `/` command popup (`[nexus]` + `[<harness>]` commands), `Ctrl+P` palette, `@` workspace file autocomplete, `!` local shell execution, mouse wheel/click support, and automatic new session creation on manual harness switch.
+- **Desktop GUI (`native/asd-nexus-desktop`)**: `eframe`/`egui` native OS window (`0%` WebView) with Antigravity-inspired `Chat` | `Dashboard` (`Ctrl+1`/`Ctrl+2`) mode split, `DarkColor` default + strict grayscale `Monochrome` toggle (`Dark | Mono` button and `--theme mono` CLI flag), collapsible Workspaces & Sessions rail, centered chat timeline (`Thought for …` accordions, tool cards, markdown responses), floating rounded composer with `/` & `@` popups and `Ctrl+P` palette, and separated 5-subtab `Dashboard` (`PLAN & Board`, `Worktree Diff`, `Subagents`, `Routing`, `Terminal & Resume`).
 
 ## 2. Node Offline & Server Checks
 
 - **`npm run typecheck`** (`tsc --noEmit`): exit code `0` (0 errors).
-- **Offline Test Suites** (`tests/normalizer-replay.test.ts`, `tests/sdk-surface.test.ts`, `tests/server-api.test.ts`): **67 passed, 0 failed, 0 skipped** in `1,174 ms`:
+- **Offline Test Suites** (`tests/normalizer-replay.test.ts`, `tests/sdk-surface.test.ts`, `tests/server-api.test.ts`, `tests/model-catalog.test.ts`): **73 passed, 0 failed, 0 skipped** across **23 suites** in `1,261 ms` (re-verified at `1,299 ms` standalone):
   - Replays 10 NDJSON fixtures (`stream.ndjson` + `error.ndjson`) across all 5 harnesses plus 7-byte chunk-boundary equivalence.
-  - Enforces v2.6.0 SDK boundary cleanliness across `src/`.
-  - Verifies HTTP auth, project/session/board/plan/routing/worktree/subagent/terminal routes, SQLite active driver attachment + Turn 2 `harnessSessionId` preservation, OpenCode hook-bridge `.jsonl` stub bypass in favor of `opencode.db`, and real child sidecar `--port 0` EOF termination.
-  - This offline suite is the `--cmd` used for `asd verify` (well under the ASD 60 s verification timeout; live E2E is not part of it).
+  - Verifies model catalog merge behavior across partial refreshes.
+  - Enforces v2.6.0 SDK boundary cleanliness across `src/` (`0` `child_process` imports).
+  - Verifies HTTP auth, project/session/board/plan/routing/worktree/subagent/terminal routes, `/api/harness-commands`, `/api/fs/list`, SQLite active driver attachment + Turn 2 `harnessSessionId` preservation, and real child sidecar `--port 0` EOF termination.
 
-## 3. Live 5-Harness CLI E2E Results (`tests/live-5harness-e2e.test.ts`)
+## 3. Native Rust Locked Test & Release Build Results
 
-Every installed CLI completed **Turn 1 SSE stream -> Turn 2 session resume recall (`AMBER-42`) -> `GET /api/sessions` discovery -> `GET /api/transcript/:harness/:id` normalized restoration** in isolated temporary git repos (`5/5` passed, `0` failed, `0` skipped; combined with the 67 offline tests: **72/72 passed**; suite duration `81.6 s`):
-
-| Harness | Model | Duration (ms) | Turn 1 SSE Kinds | Turn 2 Resume Text | Transcript Msgs | Categories Restored |
-|---|---|---:|---|---|---:|---|
-| `claude-code` | `haiku` | 22,584 | `status`, `text`, `usage` | `AMBER-42` | 4 | `user`, `assistant` |
-| `codex` | `gpt-6-luna` | 11,490 | `status`, `text`, `usage` | `AMBER-42` | 5 | `user`, `assistant` |
-| `opencode` | `opencode/glm-5.3-flash-free` | 17,560 | `status`, `text`, `usage` | `AMBER-42` | 4 | `user`, `assistant` |
-| `antigravity` | `gemini-3.8-flash-low` | 14,173 | `status`, `text` | `AMBER-42` | 5 | `user`, `assistant`, `tool_result` |
-| `cursor` | `default` | 15,429 | `status`, `thinking`, `text`, `usage` | `AMBER-42` | 17 | `user`, `thinking`, `assistant` |
-
-### Model Routing During Verification
-
-`nvidia/z-ai/glm-5.3-flash` returned an upstream 404 (`integrate.api.nvidia.com`) throughout this verification window, which broke every GLM-routed default. The E2E defaults therefore avoid that route:
-
-- `claude-code` -> `haiku` (mapped by the local `127.0.0.1:4000` proxy to Nemotron; the proxy must be running).
-- `opencode` -> `opencode/glm-5.3-flash-free` (free model, confirmed healthy).
-- `codex` -> `gpt-6-luna`, `antigravity` -> `gemini-3.8-flash-low`, `cursor` -> `default`.
-
-These defaults live in `tests/live-5harness-e2e.test.ts` and are overridable with `ASD_E2E_MODEL_*` (`docs/testing-guide.md`).
-
-### Root-Cause Fixes Applied During Verification
-
-1. **`src/server/routes/turns.ts` & `src/server/app.ts`** (commit `ba8ce27`): Wired `openProjectDb`, `isValidAsdSessionId`, and `attachDriver` into `executeTurn`, preserving existing `harness_session_id` across Turn 2 resumes on the active driver and routing raw stdout through `createHarnessStreamNormalizer` to emit `usage` events and latch `harnessSessionId`.
-2. **`src/server/routes/transcripts.ts`** (commit `dd6557e`): Prefer `opencode.db` over mirrored Claude hook-bridge `.jsonl` stubs (`~/.claude/transcripts/ses_*.jsonl`) when `transcriptPath` does not end with `.db` (retaining fallback when DB lacks entries).
-
-## 4. Native Rust Locked Test & Release Build Results
-
-- **`cargo test --manifest-path native/Cargo.toml --workspace --locked`**: **66 passed, 0 failed, 0 ignored**:
-  - `asd-nexus-client`: `11` passed (`10` unit + `1` `tests/live_sidecar.rs`)
-  - `asd-nexus-cli`: `24` passed (`6` unit + `4` `tests/cli_args.rs` + `14` `tests/tui_render.rs`)
-  - `asd-nexus-desktop`: `31` passed (`19` unit + `3` `tests/cli_lifecycle.rs` + `9` `tests/gui_headless.rs`)
+- **`cargo test --manifest-path native/Cargo.toml --workspace --locked`**: **80 passed, 0 failed, 0 ignored**:
+  - `asd-nexus-client`: `11` passed (`10` unit + `1` `tests/live_sidecar.rs` including `harness_commands` & `fs_list` roundtrips)
+  - `asd-nexus-cli`: `30` passed (`8` unit + `4` `tests/cli_args.rs` + `18` `tests/tui_render.rs`)
+  - `asd-nexus-desktop`: `39` passed (`23` unit + `3` `tests/cli_lifecycle.rs` + `13` `tests/gui_headless.rs` verifying `Chat`/`Dashboard` split, `/` & `@` popups, palette, `DarkColor` default, strict grayscale `Monochrome`, and auto-new-session on harness switch)
 - **`cargo build --release --manifest-path native/Cargo.toml --locked`**: exited `0`, built `native/target/release/asd-nexus-cli.exe` and `native/target/release/asd-nexus-desktop.exe`.
 
-## 5. Release Binary & Desktop Monochrome UI Verification
+## 4. Verification Fixes Applied During T3.1 Inspection
+
+1. **`native/asd-nexus-desktop/src/app.rs`**: Shortened sidebar header button text (`Open Folder…` -> `Open…` with tooltip) to prevent horizontal overlap with the `WORKSPACES` label at default/narrow widths.
+2. **`native/asd-nexus-desktop/src/app.rs` & `tests/gui_headless.rs`**: Prevented plain `Enter` in the focused composer from sending uncompleted `@token` or `/cmd` strings while `@`/`/` autocomplete popups are active (`Tab`/`Enter` applies/executes the highlighted popup item; `Ctrl+Enter` forces immediate send).
+3. **`native/asd-nexus-desktop/src/{cli.rs,main.rs}`**: Added `--theme <dark|mono>` flag so both `DarkColor` and strict grayscale `Monochrome` screenshots can be automated cleanly.
+
+## 5. Release Binary, Desktop Dark/Mono Captures & CLI Smoke Checks
 
 - **`./native/target/release/asd-nexus-desktop.exe --verify --project-root .`**:
-  - Exit code `0`, `"ok": true`, `"spawnedSidecar": true`, `"connection": "Connected(\"http://127.0.0.1:<ephemeral>\")"`, `"font": "font: malgun.ttf"`, `"monochromeVisuals": true`, `"frames": 132`, `"projects": 22`, `"sessions": 22`, `"boardTasks": 8`, `"modelHarnesses": 5`, `"planLoaded": true`, `"routingLoaded": true`, all 6 tabs rendered (`Chat`, `PLAN & Board`, `Worktree Diff`, `Subagents`, `Routing`, `Terminal & Resume`).
-- **`docs/evidence/desktop-monochrome.png`** (`1440x900`):
-  - Pixel audit (`x+=4, y+=4`): `0` non-grayscale pixels (`R == G == B` everywhere), `217` distinct luminance levels.
-  - Visual inspection confirmed crisp pure monochrome layout, left project/session rail, and `malgun.ttf` Korean UI text rendering.
+  - Exit code `0`, `"ok": true`, `"spawnedSidecar": true`, `"connection": "Connected(\"http://127.0.0.1:54214\")"`, `"font": "font: malgun.ttf"`, `"monochromeVisuals": true`, `"frames": 120`, `"projects": 23`, `"sessions": 35`, `"boardTasks": 4`, `"modelHarnesses": 5`, `"planLoaded": true`, `"routingLoaded": true`, `"status": "theme: Dark"`, all 6 tabs rendered (`Chat`, `PLAN & Board`, `Worktree Diff`, `Subagents`, `Routing`, `Terminal & Resume`).
+- **`docs/evidence/desktop-dark.png`** (`1440x900`) & **`docs/evidence/desktop-monochrome.png`** (`1440x900` via `--theme mono`):
+  - Pixel audit on `desktop-monochrome.png` (`x+=4, y+=4`): `0` non-grayscale pixels (`R == G == B` everywhere), `237` distinct luminance levels.
+  - Visual inspection of both PNGs confirmed crisp `Chat` | `Dashboard` top bar, clean `WORKSPACES` / `Open…` sidebar layout, Antigravity floating composer card, and `malgun.ttf` Korean text rendering.
 - **`./native/target/release/asd-nexus-cli.exe` smoke checks**:
-  - `health --json` (`exit 0`, `{ "ok": true, "version": "2.6.0" }`) and `board --json` (`exit 0`, `77` lines) succeeded with auto-managed sidecar startup and shutdown.
-- **Process Hygiene**: `node` process count observed `4 -> 3` around the desktop `--verify` run (no leaked sidecar child remained), ending at `3` node processes.
+  - `health --json --project-root .` (`exit 0`, `{ "ok": true, "version": "2.6.0", "defaultProjectRoot": "." }`), `sessions --json --limit 5 --project-root .` (`exit 0`, `55` lines), and `board --json --project-root .` (`exit 0`, `39` lines) all succeeded with auto-managed sidecar startup and shutdown.
+- **Process Hygiene**: `node` process count observed `2 -> 2` before/after `--verify`, CLI smoke checks, and both desktop `--screenshot` runs (`0` leaked child processes).

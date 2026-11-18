@@ -1,14 +1,14 @@
 {
-  "generatedAt": "2026-11-13T13:50:09.420Z",
+  "generatedAt": "2026-11-13T16:12:11.152Z",
   "totalHarnesses": 5,
   "allPassed": true,
   "harnesses": [
     {
       "harness": "claude-code",
       "model": "haiku",
-      "durationMs": 22584,
-      "asdSessionId": "asd-20261113-224847-0jsb",
-      "harnessSessionId": "622e8bca-82ca-4951-94ec-06ffa5ca0f01",
+      "durationMs": 16880,
+      "asdSessionId": "asd-20261114-011042-guex",
+      "harnessSessionId": "79f5ae14-0b22-4996-a831-a882c7531353",
       "turn1EventKinds": [
         "status",
         "text",
@@ -26,9 +26,9 @@
     {
       "harness": "codex",
       "model": "gpt-6-luna",
-      "durationMs": 11490,
-      "asdSessionId": "asd-20261113-224910-n0f6",
-      "harnessSessionId": "01a1d52b-5ab4-7613-a28b-6427bdff823d",
+      "durationMs": 13735,
+      "asdSessionId": "asd-20261114-011059-aaum",
+      "harnessSessionId": "01a1d5ad-336b-7e82-8366-16409e7c0ea5",
       "turn1EventKinds": [
         "status",
         "text",
@@ -46,9 +46,9 @@
     {
       "harness": "opencode",
       "model": "opencode/glm-5.3-flash-free",
-      "durationMs": 17560,
-      "asdSessionId": "asd-20261113-224922-mqzd",
-      "harnessSessionId": "ses_e2ad47152ffe5xfe4vHLx3mSkE",
+      "durationMs": 23393,
+      "asdSessionId": "asd-20261114-011113-hh2t",
+      "harnessSessionId": "ses_e2a528d66ffeAPxEjGnZKLoeXy",
       "turn1EventKinds": [
         "status",
         "text",
@@ -66,9 +66,9 @@
     {
       "harness": "antigravity",
       "model": "gemini-3.8-flash-low",
-      "durationMs": 14173,
-      "asdSessionId": "asd-20261113-224939-h3gq",
-      "harnessSessionId": "d0897362-4bbb-4b57-b831-8309ca386a68",
+      "durationMs": 14503,
+      "asdSessionId": "asd-20261114-011137-fop7",
+      "harnessSessionId": "a0f57283-773a-4d57-b99a-676cafcde589",
       "turn1EventKinds": [
         "status",
         "text"
@@ -86,9 +86,9 @@
     {
       "harness": "cursor",
       "model": "default",
-      "durationMs": 15429,
-      "asdSessionId": "asd-20261113-224953-evdi",
-      "harnessSessionId": "93a17358-0c59-4224-bb6c-7e55cec3d506",
+      "durationMs": 19263,
+      "asdSessionId": "asd-20261114-011151-fsu8",
+      "harnessSessionId": "7672c47e-48b9-4b7a-a89c-453cad79326f",
       "turn1EventKinds": [
         "status",
         "thinking",
@@ -97,7 +97,7 @@
       ],
       "turn2Text": "AMBER-42",
       "discovered": true,
-      "transcriptMessages": 17,
+      "transcriptMessages": 16,
       "transcriptCategories": [
         "user",
         "thinking",
