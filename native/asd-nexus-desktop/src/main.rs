@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! asd-nexus-desktop entry point: owns the native window and the sidecar
 //! lifecycle. The sidecar (`node --no-warnings src/server/index.ts --port 0`)
 //! is spawned in the background when `--server-url` is absent and is always
@@ -106,9 +107,11 @@ fn run_verify(args: &CliArgs) -> i32 {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    app.set_theme_mode(&ctx, theme::ThemeMode::Monochrome);
     let visuals_gray = theme::debug_colors(&format!("{:?}", ctx.style().visuals))
         .iter()
         .all(|[r, g, b, _]| r == g && g == b);
+    app.set_theme_mode(&ctx, theme::ThemeMode::DarkColor);
     let ok = app.health.as_ref().map(|h| h.ok).unwrap_or(false) && visuals_gray;
     let tabs: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
     let report = serde_json::json!({
@@ -179,6 +182,9 @@ fn main() {
             options,
             Box::new(move |cc| {
                 let mut app = NexusApp::new(args.effective_project_root(), run);
+                if let Some(mode) = args.theme {
+                    app.theme_mode = mode;
+                }
                 app.setup_context(&cc.egui_ctx);
                 app.conn = ConnState::Connecting;
                 let h = connect_async(&args, app.backend.sender(), slot, Some(cc.egui_ctx.clone()));

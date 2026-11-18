@@ -54,6 +54,40 @@ pub struct Entry {
     pub pending: bool,
 }
 
+impl Entry {
+    /// Single-line compact summary of `body` for inline tool/thinking headers.
+    pub fn compact_summary(&self, max_chars: usize) -> String {
+        let mut s = String::new();
+        for tok in self.body.split_whitespace() {
+            if !s.is_empty() {
+                s.push(' ');
+            }
+            s.push_str(tok);
+            if s.chars().count() >= max_chars {
+                break;
+            }
+        }
+        if s.chars().count() > max_chars {
+            let mut out: String = s.chars().take(max_chars).collect();
+            out.push('…');
+            out
+        } else {
+            s
+        }
+    }
+
+    /// Antigravity-style header label for a Thinking entry (`"Thought for …"`).
+    pub fn thought_header(&self) -> String {
+        let chars = self.body.chars().count();
+        let preview = self.compact_summary(56);
+        if preview.is_empty() {
+            format!("Thought for {chars} chars")
+        } else {
+            format!("Thought for {chars} chars · {preview}")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Usage {
     pub input: u64,
@@ -336,6 +370,7 @@ mod tests {
         assert_eq!(tl.turn_id.as_deref(), Some("t1"));
         assert_eq!(tl.count(EntryKind::Thinking), 1);
         assert_eq!(tl.entries[1].body, "ab");
+        assert!(tl.entries[1].thought_header().starts_with("Thought for 2 chars"));
         assert!(!tl.entries[2].pending);
         assert_eq!(tl.entries[3].title, "read");
         assert!(tl.entries[3].is_error);

@@ -1,12 +1,18 @@
-//! Headless egui integration tests for the desktop UI: every tab renders,
-//! every tessellated vertex is grayscale, tab/view transitions, SSE event
-//! reduction into the chat timeline, PLAN.md conflict handling, clipboard copy.
+//! Headless egui integration tests for the desktop UI:
+//! - `Chat` ↔ `Dashboard` primary mode split (`Ctrl+1` / `Ctrl+2`) and all 5 Dashboard subtabs
+//! - `ThemeMode::DarkColor` default rendering + `ThemeMode::Monochrome` transition where every
+//!   tessellated vertex passes `theme::is_grayscale`
+//! - Inline `/` slash popup (Nexus built-in + active harness commands) and `@` workspace file popup
+//! - Automatic new session creation (`CreateSession` + `HarnessCommands`) on manual harness change
+//!   (and preservation when selecting an existing session)
+//! - SSE 4-category event reduction into the chat timeline, PLAN.md conflict flows, ModelPicker merge,
+//!   and clipboard copy.
 
 use asd_nexus_client::*;
-use asd_nexus_desktop::app::{ConnState, NexusApp, RunOptions};
-use asd_nexus_desktop::backend::{Reply, SavePlanOutcome};
-use asd_nexus_desktop::state::Tab;
-use asd_nexus_desktop::theme;
+use asd_nexus_desktop::app::{ConnState, NexusApp, PaletteAction, RunOptions};
+use asd_nexus_desktop::backend::{Reply, Request, SavePlanOutcome};
+use asd_nexus_desktop::state::{PrimaryMode, Tab};
+use asd_nexus_desktop::theme::{self, ThemeMode};
 use asd_nexus_desktop::timeline::EntryKind;
 
 fn ctx() -> egui::Context {
@@ -39,7 +45,7 @@ fn plan(content: &str, sha: &str, mtime: f64) -> GetPlanResponse {
     }
 }
 
-/// Fill the app with representative data for every tab.
+/// Fill the app with representative data for Chat and every Dashboard subtab.
 fn populate(app: &mut NexusApp) {
     app.handle_reply(Reply::Projects(Ok(ListProjectsResponse {
         projects: vec![ProjectSummaryItem {
@@ -79,8 +85,51 @@ fn populate(app: &mut NexusApp) {
         active_session_id: Some("asd-1".into()),
     })));
     app.handle_reply(Reply::Models(Ok(GetModelsResponse {
-        models: [("claude-code".to_string(), vec!["sonnet".to_string(), "opus".to_string()])].into_iter().collect(),
+        models: [
+            ("claude-code".to_string(), vec!["sonnet".to_string(), "opus".to_string()]),
+            ("antigravity".to_string(), vec!["gemini-pro".to_string()]),
+        ]
+        .into_iter()
+        .collect(),
         cache_path: None,
+    })));
+    app.handle_reply(Reply::HarnessCommands(Ok(GetHarnessCommandsResponse {
+        commands: vec![
+            HarnessCommandItem {
+                name: "compact".into(),
+                description: "Compact conversation context".into(),
+                harness: "claude-code".into(),
+                source: HarnessCommandSource::Builtin,
+                kind: HarnessCommandKind::Command,
+                path: None,
+            },
+            HarnessCommandItem {
+                name: "asd-plan".into(),
+                description: "Run ASD planning workflow".into(),
+                harness: "claude-code".into(),
+                source: HarnessCommandSource::Global,
+                kind: HarnessCommandKind::Skill,
+                path: Some("~/.claude/skills/asd-plan/SKILL.md".into()),
+            },
+        ],
+    })));
+    app.handle_reply(Reply::FsList(Ok(FsListResponse {
+        project_root: app.project_root.clone(),
+        mode: FsListMode::Files,
+        base_dir: app.project_root.clone(),
+        entries: vec![
+            FsListEntry {
+                path: "native/asd-nexus-desktop/src/app.rs".into(),
+                name: "app.rs".into(),
+                is_dir: false,
+            },
+            FsListEntry {
+                path: "native/asd-nexus-desktop/src/theme.rs".into(),
+                name: "theme.rs".into(),
+                is_dir: false,
+            },
+        ],
+        truncated: Some(false),
     })));
     app.handle_reply(Reply::Board(Ok(GetBoardResponse {
         session_id: Some("asd-1".into()),
@@ -107,9 +156,17 @@ fn populate(app: &mut NexusApp) {
         worktree_path: Some(".asd/wt/1-T1".into()),
         mode: Some("working".into()),
         base_ref: Some("HEAD".into()),
-        files: vec![WorktreeDiffFile { path: "src/a.rs".into(), status: Some("M".into()), additions: Some(2), deletions: Some(1) }],
+        files: vec![WorktreeDiffFile {
+            path: "src/a.rs".into(),
+            status: Some("M".into()),
+            additions: Some(2),
+            deletions: Some(1),
+        }],
         status_short: Some(" M src/a.rs".into()),
-        diff_text: Some("diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,3 @@\n ctx\n-old\n+new\n+more".into()),
+        diff_text: Some(
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,3 @@\n ctx\n-old\n+new\n+more"
+                .into(),
+        ),
         error: None,
     })));
     app.handle_reply(Reply::Subagents(Ok(GetSubagentsResponse {
@@ -159,7 +216,7 @@ fn populate(app: &mut NexusApp) {
         ev(r#"{"kind":"thinking","thinking":"hmm"}"#),
         ev(r#"{"kind":"tool_use","toolUse":{"name":"read_file","id":"c1","input":"{}"}}"#),
         ev(r#"{"kind":"tool_result","toolResult":{"toolUseId":"c1","output":"boom","isError":true}}"#),
-        ev(r#"{"kind":"text","text":"done"}"#),
+        ev(r####"{"kind":"text","text":"### Result\n- item\n```rust\nlet x = 1;\n```\ndone"}"####),
         ev(r#"{"kind":"error","error":"oops"}"#),
     ] {
         app.handle_reply(Reply::Stream { seq: 7, msg: m });
@@ -173,7 +230,7 @@ fn assert_grayscale_output(ctx: &egui::Context, out: egui::FullOutput) -> usize 
         if let egui::epaint::Primitive::Mesh(mesh) = p.primitive {
             for v in &mesh.vertices {
                 let c = v.color;
-                assert!(c.r() == c.g() && c.g() == c.b(), "non-grayscale vertex color {c:?}");
+                assert!(theme::is_grayscale(c), "non-grayscale vertex color {c:?}");
                 n += 1;
             }
         }
@@ -181,14 +238,45 @@ fn assert_grayscale_output(ctx: &egui::Context, out: egui::FullOutput) -> usize 
     n
 }
 
+fn count_colored_vertices(ctx: &egui::Context, out: egui::FullOutput) -> (usize, usize) {
+    let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+    let mut total = 0;
+    let mut colored = 0;
+    for p in prims {
+        if let egui::epaint::Primitive::Mesh(mesh) = p.primitive {
+            for v in &mesh.vertices {
+                total += 1;
+                if !theme::is_grayscale(v.color) {
+                    colored += 1;
+                }
+            }
+        }
+    }
+    (total, colored)
+}
+
 #[test]
-fn every_tab_renders_with_only_grayscale_pixels() {
+fn dark_color_default_and_monochrome_switch_with_strict_grayscale_vertices() {
     let ctx = ctx();
     let mut app = NexusApp::new("C:/work/proj", RunOptions::default());
+    assert_eq!(app.theme_mode, ThemeMode::DarkColor, "DarkColor must be the default theme");
     populate(&mut app);
+
+    // 1. Render in default DarkColor mode: must paint colored slate/accent vertices.
     for tab in Tab::ALL {
         app.tab = tab;
-        // two frames: first lays out, second paints with settled sizes
+        let _ = frame(&ctx, &mut app, vec![]);
+        let out = frame(&ctx, &mut app, vec![]);
+        let (total, colored) = count_colored_vertices(&ctx, out);
+        assert!(total > 100, "{tab:?} painted too few vertices in DarkColor ({total})");
+        assert!(colored > 0, "{tab:?} should have non-grayscale vertices in DarkColor");
+    }
+
+    // 2. Switch to ThemeMode::Monochrome: every tessellated vertex across all tabs must be grayscale.
+    app.set_theme_mode(&ctx, ThemeMode::Monochrome);
+    assert_eq!(app.theme_mode, ThemeMode::Monochrome);
+    for tab in Tab::ALL {
+        app.tab = tab;
         let _ = frame(&ctx, &mut app, vec![]);
         let out = frame(&ctx, &mut app, vec![]);
         let vertices = assert_grayscale_output(&ctx, out);
@@ -197,9 +285,11 @@ fn every_tab_renders_with_only_grayscale_pixels() {
 }
 
 #[test]
-fn ctrl_number_switches_tabs() {
+fn chat_and_dashboard_mode_separation_and_subtabs() {
     let ctx = ctx();
     let mut app = NexusApp::new("C:/p", RunOptions::default());
+    populate(&mut app);
+
     let key = |k: egui::Key| egui::Event::Key {
         key: k,
         physical_key: None,
@@ -207,19 +297,204 @@ fn ctrl_number_switches_tabs() {
         repeat: false,
         modifiers: egui::Modifiers::COMMAND,
     };
+
+    // Starts in Chat mode
     let _ = frame(&ctx, &mut app, vec![]);
-    let expected = [
-        (egui::Key::Num3, Tab::Diff),
-        (egui::Key::Num2, Tab::Board),
-        (egui::Key::Num4, Tab::Subagents),
-        (egui::Key::Num5, Tab::Routing),
-        (egui::Key::Num6, Tab::Terminal),
-        (egui::Key::Num1, Tab::Chat),
-    ];
-    for (k, tab) in expected {
-        let _ = frame(&ctx, &mut app, vec![key(k)]);
-        assert_eq!(app.tab, tab);
+    assert_eq!(app.mode, PrimaryMode::Chat);
+    assert_eq!(app.tab, Tab::Chat);
+
+    // Ctrl+2 switches to Dashboard mode (defaults to PLAN & Board subtab)
+    let _ = frame(&ctx, &mut app, vec![key(egui::Key::Num2)]);
+    assert_eq!(app.mode, PrimaryMode::Dashboard);
+    assert_eq!(app.dashboard_tab, Tab::Board);
+    assert_eq!(app.tab, Tab::Board);
+
+    // Render all 5 Dashboard subtabs cleanly
+    for subtab in Tab::DASHBOARD {
+        app.select_dashboard_tab(subtab);
+        let out = frame(&ctx, &mut app, vec![]);
+        let (total, _) = count_colored_vertices(&ctx, out);
+        assert!(total > 100, "Dashboard subtab {subtab:?} failed to render");
+        assert_eq!(app.mode, PrimaryMode::Dashboard);
+        assert_eq!(app.tab, subtab);
+        assert_eq!(app.dashboard_tab, subtab);
     }
+
+    // Ctrl+1 returns to pure Chat mode
+    let _ = frame(&ctx, &mut app, vec![key(egui::Key::Num1)]);
+    assert_eq!(app.mode, PrimaryMode::Chat);
+    assert_eq!(app.tab, Tab::Chat);
+    // Dashboard remembers the last active subtab when switching back with Ctrl+2
+    let _ = frame(&ctx, &mut app, vec![key(egui::Key::Num2)]);
+    assert_eq!(app.mode, PrimaryMode::Dashboard);
+    assert_eq!(app.tab, Tab::Terminal);
+}
+
+#[test]
+fn slash_and_at_autocomplete_popups_render_and_apply() {
+    let ctx = ctx();
+    let mut app = NexusApp::new("C:/p", RunOptions::default());
+    populate(&mut app);
+    app.set_mode(PrimaryMode::Chat);
+
+    // 1. Type `/` in composer: popup lists both `[nexus]` built-ins and `[claude-code]` harness commands.
+    app.chat.composer = "/".into();
+    let slash_items = app.current_slash_items();
+    assert!(slash_items.iter().any(|i| i.is_nexus && i.name == "cd" && i.badge == "nexus"));
+    assert!(slash_items.iter().any(|i| i.is_nexus && i.name == "dashboard" && i.badge == "nexus"));
+    assert!(slash_items.iter().any(|i| !i.is_nexus && i.name == "compact" && i.badge == "claude-code"));
+    assert!(slash_items.iter().any(|i| !i.is_nexus && i.name == "asd-plan" && i.badge == "claude-code"));
+
+    // Render frame with slash popup open (also verify Monochrome grayscale while popup is open)
+    app.set_theme_mode(&ctx, ThemeMode::Monochrome);
+    let _ = frame(&ctx, &mut app, vec![]);
+    let out = frame(&ctx, &mut app, vec![]);
+    assert!(assert_grayscale_output(&ctx, out) > 100);
+    app.set_theme_mode(&ctx, ThemeMode::DarkColor);
+
+    // Filter to `/compact` and accept item -> inserts `/compact ` into composer
+    app.chat.composer = "/comp".into();
+    let filtered = app.current_slash_items();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].name, "compact");
+    assert!(app.accept_slash_item(0, Some(&ctx)));
+    assert_eq!(app.chat.composer, "/compact ");
+
+    // Built-in `/dashboard` command switches to Dashboard mode
+    app.chat.composer = "/dashboard".into();
+    app.send_prompt();
+    assert_eq!(app.mode, PrimaryMode::Dashboard);
+    assert!(app.chat.composer.is_empty());
+
+    // Switch back to Chat and test `@` workspace file autocomplete popup
+    app.set_mode(PrimaryMode::Chat);
+    app.chat.composer = "Please review @theme".into();
+    let at_items = app.current_at_items();
+    assert_eq!(at_items.len(), 1);
+    assert_eq!(at_items[0].path, "native/asd-nexus-desktop/src/theme.rs");
+
+    // Render frame with `@` popup open
+    let _ = frame(&ctx, &mut app, vec![]);
+    assert!(app.accept_at_item(0));
+    assert_eq!(app.chat.composer, "Please review @native/asd-nexus-desktop/src/theme.rs ");
+
+    // Pressing Enter while `@` popup is open completes the item rather than sending raw `@theme`
+    app.chat.turn_seq = None;
+    app.backend.submitted.clear();
+    app.status.clear();
+    app.chat.composer = "Inspect @theme".into();
+    ctx.memory_mut(|m| m.request_focus(egui::Id::new("chat-composer")));
+    let _ = frame(&ctx, &mut app, vec![]);
+    let enter = || egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let _ = frame(&ctx, &mut app, vec![enter()]);
+    assert_eq!(app.chat.composer, "Inspect @native/asd-nexus-desktop/src/theme.rs ");
+    assert!(app.backend.submitted.is_empty(), "Enter on @ popup must complete, not send");
+    assert!(!app.status.contains("not connected"));
+
+    // Pressing Enter while `/` popup is open applies the highlighted slash item instead of sending raw `/dash`
+    app.chat.composer = "/dash".into();
+    ctx.memory_mut(|m| m.request_focus(egui::Id::new("chat-composer")));
+    let _ = frame(&ctx, &mut app, vec![]);
+    let _ = frame(&ctx, &mut app, vec![enter()]);
+    assert_eq!(app.mode, PrimaryMode::Dashboard);
+    assert!(app.chat.composer.is_empty());
+}
+
+#[test]
+fn manual_harness_change_resets_state_and_auto_creates_new_session() {
+    let mut app = NexusApp::new("C:/p", RunOptions::default());
+    populate(&mut app);
+
+    // Select an existing session first (from left sidebar): should NOT emit CreateSession
+    app.backend.submitted.clear();
+    app.select_session(0);
+    assert_eq!(app.chat.harness(), "claude-code");
+    assert_eq!(app.active_session_id.as_deref(), Some("asd-1"));
+    assert!(app.selected_session.is_some());
+    assert!(
+        !app.backend.submitted.iter().any(|r| matches!(r, Request::CreateSession(_))),
+        "selecting an existing session must not overwrite with CreateSession"
+    );
+
+    // Add some timeline & resume state to verify reset on manual harness switch
+    app.chat.timeline.push(EntryKind::User, "", "existing message");
+    app.handle_reply(Reply::ResumeCommand(Ok(GetResumeCommandResponse {
+        success: true,
+        harness: "claude-code".into(),
+        harness_session_id: Some("cc-111".into()),
+        command: "claude".into(),
+        args: vec!["--resume".into(), "cc-111".into()],
+        cli_string: "claude --resume cc-111".into(),
+        cwd: "C:/p".into(),
+        error: None,
+    })));
+    assert!(!app.chat.timeline.entries.is_empty());
+    assert!(app.terminal.resume.is_some());
+
+    // Now manually change harness from `claude-code` (0) to `antigravity` (3)
+    app.backend.submitted.clear();
+    app.change_harness_manually(3);
+    assert_eq!(app.chat.harness(), "antigravity");
+    assert!(app.selected_session.is_none(), "selected_session must be cleared");
+    assert!(app.active_session_id.is_none(), "active_session_id must be cleared");
+    assert!(app.chat.timeline.entries.is_empty(), "chat.timeline must be cleared");
+    assert!(app.terminal.resume.is_none(), "terminal.resume must be cleared");
+
+    // Verify CreateSession and HarnessCommands requests were dispatched for `antigravity`
+    let has_create = app.backend.submitted.iter().any(|r| match r {
+        Request::CreateSession(req) => req.harness.as_deref() == Some("antigravity"),
+        _ => false,
+    });
+    let has_cmds = app.backend.submitted.iter().any(|r| match r {
+        Request::HarnessCommands(req) => req.harness.as_deref() == Some("antigravity"),
+        _ => false,
+    });
+    assert!(has_create, "manual harness switch must auto-call create_session()");
+    assert!(has_cmds, "manual harness switch must refresh harness_commands");
+
+    // Simulate CreateSession reply arriving from backend
+    app.handle_reply(Reply::CreateSession(Ok(CreateSessionResponse {
+        success: true,
+        session_id: "asd-new-agy".into(),
+        phase: SessionPhase::Planning,
+        error: None,
+    })));
+    assert_eq!(app.active_session_id.as_deref(), Some("asd-new-agy"));
+}
+
+#[test]
+fn command_palette_modal_renders_and_executes_actions() {
+    let ctx = ctx();
+    let mut app = NexusApp::new("C:/p", RunOptions::default());
+    populate(&mut app);
+
+    let ctrl_p = egui::Event::Key {
+        key: egui::Key::P,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    };
+    let _ = frame(&ctx, &mut app, vec![ctrl_p]);
+    assert!(app.palette_open);
+
+    // Render palette modal and verify entries
+    let _ = frame(&ctx, &mut app, vec![]);
+    let entries = app.build_palette_entries();
+    assert!(entries.iter().any(|e| e.category == "Project"));
+    assert!(entries.iter().any(|e| e.category == "Harness"));
+    assert!(entries.iter().any(|e| e.category == "Command"));
+
+    app.execute_palette_action(PaletteAction::SwitchDashboardTab(Tab::Routing), Some(&ctx));
+    assert!(!app.palette_open);
+    assert_eq!(app.mode, PrimaryMode::Dashboard);
+    assert_eq!(app.tab, Tab::Routing);
 }
 
 #[test]
@@ -384,6 +659,39 @@ fn connection_failure_is_reported_and_ui_still_renders() {
     assert!(matches!(app.conn, ConnState::Failed(_)));
     assert!(app.status.contains("node not found"));
     app.composer_send_offline_check();
+}
+
+#[test]
+fn composer_enter_sends_and_shift_enter_inserts_newline() {
+    let ctx = ctx();
+    let mut app = NexusApp::new("C:/p", RunOptions::default());
+    app.backend.inject(Reply::Connected(Err("offline".into())));
+    app.chat.composer = "hello".into();
+
+    ctx.memory_mut(|m| m.request_focus(egui::Id::new("chat-composer")));
+    let _ = frame(&ctx, &mut app, vec![]);
+
+    let key = |modifiers| egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    };
+
+    let _ = frame(&ctx, &mut app, vec![key(egui::Modifiers::SHIFT)]);
+    assert_eq!(app.chat.composer, "hello\n", "Shift+Enter must insert a newline");
+    assert!(!app.chat.is_streaming());
+
+    app.status.clear();
+    let _ = frame(&ctx, &mut app, vec![key(egui::Modifiers::NONE)]);
+    assert!(!app.chat.is_streaming());
+    assert!(
+        app.status.contains("not connected"),
+        "plain Enter must attempt a send; status={:?}",
+        app.status
+    );
+    assert_eq!(app.chat.composer, "hello\n", "prompt kept when send fails");
 }
 
 trait OfflineCheck {

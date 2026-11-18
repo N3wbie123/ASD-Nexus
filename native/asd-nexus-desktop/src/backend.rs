@@ -18,6 +18,8 @@ pub enum Request {
     PromoteSession(PromoteSessionRequest),
     Transcript(GetTranscriptRequest),
     Models { refresh: bool },
+    HarnessCommands(GetHarnessCommandsRequest),
+    FsList(FsListRequest),
     Board(GetBoardRequest),
     Plan { project_root: Option<String>, session_id: Option<String> },
     /// Pre-flight GET then save if sha/mtime unchanged.
@@ -51,6 +53,8 @@ impl Request {
             Request::PromoteSession(_) => "promote session",
             Request::Transcript(_) => "transcript",
             Request::Models { .. } => "models",
+            Request::HarnessCommands(_) => "harness commands",
+            Request::FsList(_) => "fs list",
             Request::Board(_) => "board",
             Request::Plan { .. } => "plan",
             Request::SavePlan { .. } => "save plan",
@@ -96,6 +100,8 @@ pub enum Reply {
     PromoteSession(R<PromoteSessionResponse>),
     Transcript(R<GetTranscriptResponse>),
     Models(R<GetModelsResponse>),
+    HarnessCommands(R<GetHarnessCommandsResponse>),
+    FsList(R<FsListResponse>),
     Board(R<GetBoardResponse>),
     Plan(R<GetPlanResponse>),
     SavePlan(R<SavePlanOutcome>),
@@ -170,6 +176,8 @@ pub fn execute(c: &NexusClient, req: Request, tx: &Sender<Reply>, seq: u64) -> O
         } else {
             c.models(&GetModelsRequest::default())
         })),
+        Request::HarnessCommands(r) => Reply::HarnessCommands(e(c.harness_commands(&r))),
+        Request::FsList(r) => Reply::FsList(e(c.fs_list(&r))),
         Request::Board(r) => Reply::Board(e(c.board(&r))),
         Request::Plan { project_root, session_id } => {
             Reply::Plan(e(c.get_plan(project_root.as_deref(), session_id.as_deref())))
@@ -250,6 +258,7 @@ pub struct Backend {
     rx: Receiver<Reply>,
     repaint: Option<egui::Context>,
     pub in_flight: usize,
+    pub submitted: Vec<Request>,
     seq: u64,
 }
 
@@ -262,7 +271,7 @@ impl Default for Backend {
 impl Backend {
     pub fn new(client: Option<NexusClient>) -> Self {
         let (tx, rx) = mpsc::channel();
-        Self { client, tx, rx, repaint: None, in_flight: 0, seq: 0 }
+        Self { client, tx, rx, repaint: None, in_flight: 0, submitted: Vec::new(), seq: 0 }
     }
 
     pub fn set_repaint(&mut self, ctx: egui::Context) {
@@ -288,6 +297,10 @@ impl Backend {
 
     /// Submit a request. Returns the sequence number, or an error if not connected.
     pub fn submit(&mut self, req: Request) -> R<u64> {
+        self.submitted.push(req.clone());
+        if self.submitted.len() > 256 {
+            self.submitted.remove(0);
+        }
         let Some(client) = self.client.clone() else {
             return Err(format!("{}: not connected to sidecar", req.name()));
         };
@@ -359,6 +372,7 @@ mod tests {
         let mut b = Backend::new(None);
         assert!(b.submit(Request::Health).unwrap_err().contains("not connected"));
         assert_eq!(b.in_flight, 0);
+        assert_eq!(b.submitted.len(), 1);
     }
 
     #[test]

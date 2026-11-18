@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use crate::theme::ThemeMode;
+
 pub const USAGE: &str = "\
 asd-nexus-desktop — pure native ASD-Nexus desktop GUI (eframe/egui, 0% WebView)
 
@@ -15,6 +17,7 @@ OPTIONS:
     --home <dir>             Override ASD home directory passed to the spawned sidecar
     --node <path>            Node binary used to spawn the sidecar (default: node)
     --server-script <path>   Explicit path to src/server/index.ts
+    --theme <dark|mono>      Initial UI theme: dark (default) or mono
     --verify                 Non-interactive: connect, render every tab headlessly,
                              print a JSON report and exit (no window)
     --exit-after <secs>      Open the window and close it automatically after <secs>
@@ -30,6 +33,7 @@ pub struct CliArgs {
     pub home: Option<PathBuf>,
     pub node_bin: Option<PathBuf>,
     pub server_script: Option<PathBuf>,
+    pub theme: Option<ThemeMode>,
     pub verify: bool,
     pub exit_after_secs: Option<f64>,
     pub screenshot: Option<PathBuf>,
@@ -63,6 +67,14 @@ impl CliArgs {
                 "--home" => out.home = Some(PathBuf::from(value("--home")?)),
                 "--node" => out.node_bin = Some(PathBuf::from(value("--node")?)),
                 "--server-script" => out.server_script = Some(PathBuf::from(value("--server-script")?)),
+                "--theme" => {
+                    let v = value("--theme")?.to_ascii_lowercase();
+                    out.theme = Some(match v.as_str() {
+                        "dark" | "darkcolor" | "color" => ThemeMode::DarkColor,
+                        "mono" | "monochrome" => ThemeMode::Monochrome,
+                        _ => return Err(format!("invalid --theme value: {v} (expected dark|mono)")),
+                    });
+                }
                 "--exit-after" => {
                     let v = value("--exit-after")?;
                     let secs: f64 = v.parse().map_err(|_| format!("invalid --exit-after value: {v}"))?;
@@ -142,6 +154,9 @@ mod tests {
         assert!(CliArgs::parse(["--bogus"]).is_err());
         assert!(CliArgs::parse(["--exit-after", "x"]).is_err());
         assert!(CliArgs::parse(["--exit-after", "-1"]).is_err());
+        assert!(CliArgs::parse(["--theme", "bogus"]).is_err());
+        assert_eq!(CliArgs::parse(["--theme", "mono"]).unwrap().theme, Some(ThemeMode::Monochrome));
+        assert_eq!(CliArgs::parse(["--theme", "dark"]).unwrap().theme, Some(ThemeMode::DarkColor));
         assert!(CliArgs::parse(["-h"]).unwrap().help);
     }
 }

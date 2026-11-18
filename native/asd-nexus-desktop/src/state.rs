@@ -1,16 +1,33 @@
-//! Pure (UI-agnostic) view state: tabs, model picker, PLAN.md editor with
-//! conflict detection, routing editor, kanban grouping.
+//! Pure (UI-agnostic) view state: primary modes, tabs, model picker, slash/@
+//! autocomplete helpers, PLAN.md editor with conflict detection, routing
+//! editor, kanban grouping.
 
 use std::collections::BTreeMap;
 
-use asd_nexus_client::{BoardTaskItem, GetPlanResponse, SavePlanRequest, SavePlanResponse};
+use asd_nexus_client::{BoardTaskItem, FsListEntry, GetPlanResponse, HarnessCommandItem, SavePlanRequest, SavePlanResponse};
 use serde_json::Value;
 
 pub const HARNESSES: [&str; 5] = ["claude-code", "opencode", "codex", "antigravity", "cursor"];
 
 // ---------------------------------------------------------------------------
-// Tabs
+// Primary Mode (Chat vs Dashboard) & Tabs
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PrimaryMode {
+    #[default]
+    Chat,
+    Dashboard,
+}
+
+impl PrimaryMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            PrimaryMode::Chat => "Chat",
+            PrimaryMode::Dashboard => "Dashboard",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Tab {
@@ -25,6 +42,7 @@ pub enum Tab {
 
 impl Tab {
     pub const ALL: [Tab; 6] = [Tab::Chat, Tab::Board, Tab::Diff, Tab::Subagents, Tab::Routing, Tab::Terminal];
+    pub const DASHBOARD: [Tab; 5] = [Tab::Board, Tab::Diff, Tab::Subagents, Tab::Routing, Tab::Terminal];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -35,6 +53,10 @@ impl Tab {
             Tab::Routing => "Routing",
             Tab::Terminal => "Terminal & Resume",
         }
+    }
+
+    pub fn is_dashboard(self) -> bool {
+        !matches!(self, Tab::Chat)
     }
 
     /// Keyboard shortcut index (Ctrl+1..6).
@@ -54,6 +76,119 @@ impl Tab {
 }
 
 // ---------------------------------------------------------------------------
+// Slash (`/`) & File (`@`) Autocomplete Helpers
+// ---------------------------------------------------------------------------
+
+/// Built-in Nexus slash commands: `(command_without_slash, description)`.
+pub const NEXUS_SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("cd", "Switch workspace directory (/cd <path> or open folder picker)"),
+    ("sessions", "Browse or switch sessions"),
+    ("new", "Start a new chat session in active harness"),
+    ("models", "Refresh available models for harnesses"),
+    ("harness", "Switch active harness and open new session (/harness <name>)"),
+    ("dashboard", "Switch to Dashboard orchestration view"),
+    ("theme", "Toggle Dark / Monochrome theme"),
+    ("clear", "Clear current chat timeline"),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashPopupItem {
+    /// Name without leading `/` (e.g. `"cd"`, `"compact"`).
+    pub name: String,
+    /// Badge text (`"nexus"` or harness name like `"claude-code"`).
+    pub badge: String,
+    pub description: String,
+    pub is_nexus: bool,
+}
+
+/// If the composer starts with a slash token currently being typed (no whitespace
+/// after the `/token` and single-line), returns the query after `/`.
+pub fn extract_slash_query(composer: &str) -> Option<&str> {
+    let trimmed = composer.trim_start_matches(' ');
+    let rest = trimmed.strip_prefix('/')?;
+    if rest.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Build filtered slash autocomplete items combining `[nexus]` built-ins and
+/// `[<harness>]` specific commands from `GET /api/harness-commands`.
+pub fn build_slash_items(query: &str, harness: &str, harness_cmds: &[HarnessCommandItem]) -> Vec<SlashPopupItem> {
+    let needle = query.trim().to_ascii_lowercase();
+    let mut out = Vec::new();
+    for (name, desc) in NEXUS_SLASH_COMMANDS {
+        if needle.is_empty()
+            || name.to_ascii_lowercase().contains(&needle)
+            || desc.to_ascii_lowercase().contains(&needle)
+        {
+            out.push(SlashPopupItem {
+                name: (*name).to_string(),
+                badge: "nexus".to_string(),
+                description: (*desc).to_string(),
+                is_nexus: true,
+            });
+        }
+    }
+    for cmd in harness_cmds {
+        if !cmd.harness.is_empty() && cmd.harness != harness {
+            continue;
+        }
+        let clean_name = cmd.name.trim_start_matches('/');
+        if needle.is_empty()
+            || clean_name.to_ascii_lowercase().contains(&needle)
+            || cmd.description.to_ascii_lowercase().contains(&needle)
+        {
+            out.push(SlashPopupItem {
+                name: clean_name.to_string(),
+                badge: harness.to_string(),
+                description: cmd.description.clone(),
+                is_nexus: false,
+            });
+        }
+    }
+    out
+}
+
+/// If the trailing token of `composer` starts with `@` (at the start of input or
+/// preceded by whitespace), returns `(byte_index_of_at, query_after_at)`.
+pub fn extract_at_query(composer: &str) -> Option<(usize, &str)> {
+    if composer.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let last_ws = composer.rfind(char::is_whitespace);
+    let token_start = last_ws.map(|idx| idx + composer[idx..].chars().next().unwrap().len_utf8()).unwrap_or(0);
+    let token = &composer[token_start..];
+    let query = token.strip_prefix('@')?;
+    Some((token_start, query))
+}
+
+/// Filter workspace file entries by `@query` substring match.
+pub fn filter_fs_entries<'a>(entries: &'a [FsListEntry], query: &str, limit: usize) -> Vec<&'a FsListEntry> {
+    let needle = query.trim().to_ascii_lowercase();
+    entries
+        .iter()
+        .filter(|e| {
+            needle.is_empty()
+                || e.path.to_ascii_lowercase().contains(&needle)
+                || e.name.to_ascii_lowercase().contains(&needle)
+        })
+        .take(limit)
+        .collect()
+}
+
+/// Replace the trailing `@<query>` token in `composer` with `@<rel_path> `.
+pub fn replace_at_token(composer: &str, rel_path: &str) -> String {
+    if let Some((at_idx, _)) = extract_at_query(composer) {
+        format!("{}@{} ", &composer[..at_idx], rel_path)
+    } else if composer.is_empty() || composer.ends_with(char::is_whitespace) {
+        format!("{composer}@{rel_path} ")
+    } else {
+        format!("{composer} @{rel_path} ")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Model picker
 // ---------------------------------------------------------------------------
 
@@ -66,7 +201,14 @@ pub struct ModelPicker {
 
 impl ModelPicker {
     pub fn set_models(&mut self, models: impl IntoIterator<Item = (String, Vec<String>)>) {
-        self.models = models.into_iter().collect();
+        for (harness, incoming) in models {
+            let existing = self.models.entry(harness).or_default();
+            for model in incoming {
+                if !existing.iter().any(|m| m == &model) {
+                    existing.push(model);
+                }
+            }
+        }
     }
 
     /// Models for a harness filtered by case-insensitive substring match.
@@ -85,6 +227,7 @@ impl ModelPicker {
 
     /// Drop a selection that is not offered by the new harness.
     pub fn on_harness_changed(&mut self, harness: &str) {
+        self.filter.clear();
         if let Some(sel) = &self.selected {
             let known = self.models.get(harness).map(|v| v.contains(sel)).unwrap_or(false);
             if !known {
@@ -387,6 +530,7 @@ pub fn group_kanban(tasks: &[BoardTaskItem]) -> [Vec<&BoardTaskItem>; 5] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asd_nexus_client::{HarnessCommandKind, HarnessCommandSource};
 
     fn plan(content: &str, sha: &str, mtime: f64) -> GetPlanResponse {
         GetPlanResponse {
@@ -405,6 +549,34 @@ mod tests {
         assert_eq!(Tab::Chat.prev(), Tab::Terminal);
         assert_eq!(Tab::from_index(5), Some(Tab::Terminal));
         assert_eq!(Tab::from_index(6), None);
+        assert_eq!(Tab::DASHBOARD.len(), 5);
+        assert!(!Tab::Chat.is_dashboard());
+        assert!(Tab::Board.is_dashboard());
+    }
+
+    #[test]
+    fn slash_and_at_autocomplete_parsing() {
+        assert_eq!(extract_slash_query("/"), Some(""));
+        assert_eq!(extract_slash_query("  /co"), Some("co"));
+        assert_eq!(extract_slash_query("/co arg"), None);
+        assert_eq!(extract_slash_query("hello /co"), None);
+
+        let h_cmds = vec![HarnessCommandItem {
+            name: "compact".into(),
+            description: "Compact conversation".into(),
+            harness: "claude-code".into(),
+            source: HarnessCommandSource::Builtin,
+            kind: HarnessCommandKind::Command,
+            path: None,
+        }];
+        let all = build_slash_items("", "claude-code", &h_cmds);
+        assert!(all.iter().any(|i| i.is_nexus && i.name == "cd" && i.badge == "nexus"));
+        assert!(all.iter().any(|i| !i.is_nexus && i.name == "compact" && i.badge == "claude-code"));
+
+        assert_eq!(extract_at_query("@src/ma"), Some((0, "src/ma")));
+        assert_eq!(extract_at_query("check @Cargo.to"), Some((6, "Cargo.to")));
+        assert_eq!(extract_at_query("check @Cargo.toml "), None);
+        assert_eq!(replace_at_token("check @Car", "Cargo.toml"), "check @Cargo.toml ");
     }
 
     #[test]
@@ -419,6 +591,34 @@ mod tests {
         assert_eq!(ed.buffer, "b");
         assert_eq!(ed.sha256.as_deref(), Some("h2"));
         assert!(!ed.is_dirty());
+    }
+
+    #[test]
+    fn model_picker_merges_models_and_clears_filter_on_harness_change() {
+        let mut p = ModelPicker::default();
+        p.set_models(vec![
+            ("opencode".to_string(), vec!["a".to_string(), "b".to_string()]),
+            ("codex".to_string(), vec!["g".to_string()]),
+        ]);
+        p.set_models(vec![
+            ("opencode".to_string(), vec!["b".to_string(), "c".to_string()]),
+            ("claude-code".to_string(), vec!["sonnet".to_string()]),
+        ]);
+        assert_eq!(
+            p.models["opencode"],
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(p.models["codex"], vec!["g".to_string()]);
+        assert_eq!(p.models["claude-code"], vec!["sonnet".to_string()]);
+
+        p.filter = "zzz".to_string();
+        p.selected = Some("c".to_string());
+        p.on_harness_changed("opencode");
+        assert!(p.filter.is_empty());
+        assert_eq!(p.selected.as_deref(), Some("c"));
+
+        p.on_harness_changed("codex");
+        assert!(p.selected.is_none());
     }
 
     #[test]
