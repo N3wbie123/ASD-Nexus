@@ -27,9 +27,11 @@ import {
   type SaveSessionMemoResponse,
   type SetForegroundSessionResponse,
   type SetSessionPhaseResponse,
+  type SetSessionAutoApproveResponse,
   type GetResumeCommandResponse,
   type GetTranscriptResponse,
   type TurnCancelResponse,
+  type TurnPermissionDecisionResponse,
   type GetBoardResponse,
   type GetPlanResponse,
   type SavePlanResponse,
@@ -497,6 +499,101 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         await close();
       }
     });
+
+    it("POST /api/sessions with autoApprove: false, GET /api/sessions, and POST /api/sessions/auto-approve toggle", async () => {
+      const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-autoapprove-proj-"));
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-autoapprove-home-"));
+      let createdAsdId = "";
+
+      const { baseUrl, close } = await startTestServer(
+        {
+          discoverProjectCliSessions: () =>
+            createdAsdId
+              ? [
+                  {
+                    harness: "claude-code" as any,
+                    harnessSessionId: "cli-aa-1",
+                    projectRoot: tmpProject,
+                    updatedAt: Date.now(),
+                    summary: "Manual approval session",
+                    asdSessionId: createdAsdId,
+                    startedAt: Date.now(),
+                  },
+                ]
+              : [],
+        },
+        { defaultProjectRoot: tmpProject, homeDir: tmpHome }
+      );
+
+      try {
+        // 1. Create session with autoApprove: false
+        const createRes = await fetch(`${baseUrl}/api/sessions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            projectRoot: tmpProject,
+            harness: "claude-code",
+            model: "claude-sonnet-4-6",
+            autoApprove: false,
+            memo: "Manual approval session",
+          }),
+        });
+        assert.equal(createRes.status, 200);
+        const createData = (await createRes.json()) as CreateSessionResponse;
+        assert.equal(createData.success, true);
+        assert.equal(createData.autoApprove, false);
+        createdAsdId = createData.sessionId;
+        assert.ok(createdAsdId);
+
+        // 2. GET /api/sessions reflects autoApprove: false from SQLite
+        const listRes1 = await fetch(
+          `${baseUrl}/api/sessions?projectRoot=${encodeURIComponent(tmpProject)}`
+        );
+        assert.equal(listRes1.status, 200);
+        const listData1 = (await listRes1.json()) as GetSessionsResponse;
+        assert.equal(listData1.sessions.length, 1);
+        assert.equal(listData1.sessions[0]?.asdSessionId, createdAsdId);
+        assert.equal(listData1.sessions[0]?.autoApprove, false);
+
+        // 3. Invalid payload validation on POST /api/sessions/auto-approve
+        const badRes = await fetch(`${baseUrl}/api/sessions/auto-approve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectRoot: tmpProject, sessionId: "", autoApprove: "yes" }),
+        });
+        assert.equal(badRes.status, 200);
+        const badData = (await badRes.json()) as SetSessionAutoApproveResponse;
+        assert.equal(badData.success, false);
+        assert.ok(badData.error);
+
+        // 4. Toggle autoApprove to true
+        const toggleRes = await fetch(`${baseUrl}/api/sessions/auto-approve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            projectRoot: tmpProject,
+            sessionId: createdAsdId,
+            autoApprove: true,
+          }),
+        });
+        assert.equal(toggleRes.status, 200);
+        const toggleData = (await toggleRes.json()) as SetSessionAutoApproveResponse;
+        assert.equal(toggleData.success, true);
+        assert.equal(toggleData.sessionId, createdAsdId);
+        assert.equal(toggleData.autoApprove, true);
+
+        // 5. GET /api/sessions now reflects autoApprove: true
+        const listRes2 = await fetch(
+          `${baseUrl}/api/sessions?projectRoot=${encodeURIComponent(tmpProject)}`
+        );
+        const listData2 = (await listRes2.json()) as GetSessionsResponse;
+        assert.equal(listData2.sessions[0]?.autoApprove, true);
+      } finally {
+        await close();
+        fs.rmSync(tmpProject, { recursive: true, force: true });
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("Transcripts API", () => {
@@ -879,6 +976,258 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         assert.ok(t2Events.some((e) => e.kind === "text" && e.text === "Turn 2 Resumed"));
         assert.equal(t2Events.at(-1)?.status, "done");
         assert.deepEqual(seenActiveDriverSids, [null, "thr-real-001"]);
+      } finally {
+        await close();
+        fs.rmSync(tmpProject, { recursive: true, force: true });
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("enforces server-side harness immutability while allowing same-harness model updates", async () => {
+      const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-immutable-proj-"));
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-immutable-home-"));
+      const seenModels: Array<string | null> = [];
+
+      const { baseUrl, close } = await startTestServer(
+        {
+          runDriverTurn: async (input) => {
+            const active = input.db.getActiveDriver(input.sessionId);
+            seenModels.push(active?.model ?? null);
+            input.onEvent?.({
+              type: "text",
+              harness: active?.harness || "claude-code",
+              text: `Model=${active?.model ?? "default"}`,
+              timestamp: Date.now(),
+            });
+            return { exitCode: 0, harnessSessionId: "cl-sid-immutable-1" } as any;
+          },
+        },
+        { defaultProjectRoot: tmpProject, homeDir: tmpHome }
+      );
+
+      async function collectTurnEvents(payload: Record<string, unknown>) {
+        const res = await fetch(`${baseUrl}/api/turn/stream`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+          },
+          body: JSON.stringify(payload),
+        });
+        assert.equal(res.status, 200);
+        const text = await res.text();
+        return text
+          .split("\n\n")
+          .map((chunk) => chunk.trim())
+          .filter((line) => line.startsWith("data: "))
+          .map((line) => JSON.parse(line.slice(6)) as OrchestratorEvent);
+      }
+
+      try {
+        // Turn 1: starts session on claude-code
+        const t1Events = await collectTurnEvents({
+          projectRoot: tmpProject,
+          harness: "claude-code",
+          model: "claude-sonnet-4-6",
+          prompt: "Turn 1",
+        });
+        const asdSessionId = t1Events[0]?.sessionId;
+        assert.ok(asdSessionId);
+        assert.equal(t1Events.at(-1)?.status, "done");
+
+        // Attempt Turn 2 on same session with codex -> rejected with HARNESS_IMMUTABLE
+        const t2Rejected = await collectTurnEvents({
+          projectRoot: tmpProject,
+          sessionId: asdSessionId,
+          harness: "codex",
+          prompt: "Illegal switch",
+        });
+        const errEvt = t2Rejected.find((e) => e.kind === "error");
+        assert.ok(errEvt?.error?.includes("HARNESS_IMMUTABLE"));
+        assert.equal(t2Rejected.at(-1)?.kind, "status");
+        assert.equal(t2Rejected.at(-1)?.status, "interrupted");
+
+        // Verify active driver in SQLite was NOT switched to codex
+        sdk.withReadOnlyProjectDb(
+          tmpProject,
+          (db) => {
+            const active = db.getActiveDriver(asdSessionId);
+            assert.equal(active?.harness, "claude-code");
+            assert.equal(active?.model, "claude-sonnet-4-6");
+          },
+          tmpHome
+        );
+
+        // Turn 2 with same harness (claude-code) and new model (claude-opus-4-6) succeeds
+        const t2Allowed = await collectTurnEvents({
+          projectRoot: tmpProject,
+          sessionId: asdSessionId,
+          harness: "claude-code",
+          model: "claude-opus-4-6",
+          prompt: "Model upgrade",
+        });
+        assert.ok(t2Allowed.some((e) => e.kind === "text" && e.text === "Model=claude-opus-4-6"));
+        assert.equal(t2Allowed.at(-1)?.status, "done");
+        assert.deepEqual(seenModels, ["claude-sonnet-4-6", "claude-opus-4-6"]);
+      } finally {
+        await close();
+        fs.rmSync(tmpProject, { recursive: true, force: true });
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("brokers interactive permission requests via SSE permission_request and POST /api/turn/permission (allow_always persists autoApprove)", async () => {
+      const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-perm-proj-"));
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-perm-home-"));
+      const permissionResults: unknown[] = [];
+
+      const { baseUrl, close } = await startTestServer(
+        {
+          runDriverTurn: async (input) => {
+            assert.equal(input.autoApprove, false);
+            assert.equal(typeof input.onPermissionRequest, "function");
+
+            // 1. Interactive permission prompt (must wait for POST /api/turn/permission)
+            const firstDecision = await input.onPermissionRequest({
+              toolCall: {
+                title: "Write src/index.ts",
+                kind: "edit",
+                rawInput: { path: "src/index.ts" },
+                locations: [{ path: "src/index.ts", line: 10 }],
+              },
+              options: [
+                { optionId: "opt-once", name: "Allow once", kind: "allow_once" },
+                { optionId: "opt-always", name: "Always allow", kind: "allow_always" },
+                { optionId: "opt-deny", name: "Reject", kind: "reject_once" },
+              ],
+            });
+            permissionResults.push(firstDecision);
+
+            // 2. After allow_always, subsequent permission request in same turn auto-approves immediately
+            const secondDecision = await input.onPermissionRequest({
+              toolCall: {
+                title: "Run tests",
+                kind: "execute",
+              },
+              options: [
+                { optionId: "opt-once-2", name: "Allow once", kind: "allow_once" },
+                { optionId: "opt-deny-2", name: "Reject", kind: "reject_once" },
+              ],
+            });
+            permissionResults.push(secondDecision);
+
+            input.onEvent?.({
+              type: "text",
+              harness: "claude-code",
+              text: "Permission granted and completed",
+              timestamp: Date.now(),
+            });
+            return { exitCode: 0 } as any;
+          },
+        },
+        { defaultProjectRoot: tmpProject, homeDir: tmpHome }
+      );
+
+      try {
+        // Create session with autoApprove: false
+        const createRes = await fetch(`${baseUrl}/api/sessions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            projectRoot: tmpProject,
+            harness: "claude-code",
+            autoApprove: false,
+          }),
+        });
+        const createData = (await createRes.json()) as CreateSessionResponse;
+        assert.equal(createData.success, true);
+        assert.equal(createData.autoApprove, false);
+
+        const events: OrchestratorEvent[] = [];
+        let permissionRequestEvt: OrchestratorEvent | undefined;
+
+        const streamPromise = (async () => {
+          const res = await fetch(`${baseUrl}/api/turn/stream`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+            },
+            body: JSON.stringify({
+              projectRoot: tmpProject,
+              sessionId: createData.sessionId,
+              harness: "claude-code",
+              prompt: "Edit file",
+            }),
+          });
+          assert.equal(res.status, 200);
+          const reader = res.body?.getReader();
+          assert.ok(reader);
+          const decoder = new TextDecoder();
+          let buf = "";
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const parts = buf.split("\n\n");
+            buf = parts.pop() || "";
+            for (const p of parts) {
+              const line = p.trim();
+              if (line.startsWith("data: ")) {
+                const evt = JSON.parse(line.slice(6)) as OrchestratorEvent;
+                events.push(evt);
+                if (evt.kind === "permission_request") {
+                  permissionRequestEvt = evt;
+                }
+              }
+            }
+          }
+        })();
+
+        // Wait for permission_request SSE event
+        while (!permissionRequestEvt) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+
+        assert.equal(permissionRequestEvt.permissionRequest?.toolName, "Write src/index.ts");
+        assert.equal(permissionRequestEvt.permissionRequest?.toolKind, "edit");
+        assert.deepEqual(permissionRequestEvt.permissionRequest?.locations, ["src/index.ts"]);
+        assert.equal(permissionRequestEvt.permissionRequest?.options.length, 3);
+
+        // Respond with allow_always ("opt-always")
+        const decisionRes = await fetch(`${baseUrl}/api/turn/permission`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            turnId: permissionRequestEvt.turnId,
+            requestId: permissionRequestEvt.permissionRequest?.requestId,
+            outcome: "selected",
+            optionId: "opt-always",
+          }),
+        });
+        assert.equal(decisionRes.status, 200);
+        const decisionData = (await decisionRes.json()) as TurnPermissionDecisionResponse;
+        assert.equal(decisionData.success, true);
+
+        await streamPromise;
+
+        assert.deepEqual(permissionResults, [
+          { outcome: { outcome: "selected", optionId: "opt-always" } },
+          { outcome: { outcome: "selected", optionId: "opt-once-2" } },
+        ]);
+        assert.equal(events.filter((e) => e.kind === "permission_request").length, 1);
+        assert.ok(events.some((e) => e.kind === "text" && e.text === "Permission granted and completed"));
+        assert.equal(events.at(-1)?.status, "done");
+
+        // Verify allow_always persisted auto_approve = 1 in SQLite
+        sdk.withReadOnlyProjectDb(
+          tmpProject,
+          (db) => {
+            const row = db.getSession(createData.sessionId);
+            assert.equal(row?.auto_approve, 1);
+          },
+          tmpHome
+        );
       } finally {
         await close();
         fs.rmSync(tmpProject, { recursive: true, force: true });

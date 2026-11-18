@@ -21,6 +21,7 @@ import {
   saveMemoRoute,
   setForegroundRoute,
   setPhaseRoute,
+  setAutoApproveRoute,
   getResumeCommandRoute,
 } from "./routes/sessions.ts";
 import { getTranscriptRoute } from "./routes/transcripts.ts";
@@ -28,6 +29,7 @@ import {
   turnStreamRoute,
   turnStreamGetRoute,
   turnCancelRoute,
+  turnPermissionRoute,
   cancelAllActiveTurns,
 } from "./routes/turns.ts";
 import {
@@ -318,12 +320,20 @@ async function matchAndDispatchRoute(ctx: RequestContext): Promise<void> {
     setPhaseRoute(ctx);
     return;
   }
+  if (method === "POST" && path === "/api/sessions/auto-approve") {
+    setAutoApproveRoute(ctx);
+    return;
+  }
   if (method === "POST" && path === "/api/turn/stream") {
     await turnStreamRoute(ctx);
     return;
   }
   if (method === "POST" && path === "/api/turn/cancel") {
     turnCancelRoute(ctx);
+    return;
+  }
+  if (method === "POST" && path === "/api/turn/permission") {
+    turnPermissionRoute(ctx);
     return;
   }
   if (method === "GET" && path === "/api/board") {

@@ -10,6 +10,7 @@ import type {
   SaveSessionMemoResponse,
   SetForegroundSessionResponse,
   SetSessionPhaseResponse,
+  SetSessionAutoApproveResponse,
   GetResumeCommandResponse,
 } from "../../shared/protocol.ts";
 
@@ -27,19 +28,55 @@ export function listSessionsRoute(ctx: RequestContext): void {
     });
     const activeSessionId = ctx.deps.getForegroundSessionId(projectRoot);
 
+    const autoApproveBySessionId = new Map<string, boolean>();
+    const asdIds = Array.from(
+      new Set(
+        (rawSessions || [])
+          .map((s) => s.asdSessionId)
+          .filter((id): id is string => Boolean(id))
+      )
+    );
+    if (asdIds.length > 0) {
+      try {
+        ctx.deps.withReadOnlyProjectDb(
+          projectRoot,
+          (db) => {
+            if (typeof db.getSession !== "function") return;
+            for (const sid of asdIds) {
+              const row = db.getSession(sid);
+              if (row && row.auto_approve !== undefined) {
+                autoApproveBySessionId.set(sid, row.auto_approve !== 0);
+              }
+            }
+          },
+          ctx.homeDir
+        );
+      } catch {
+        // Ignore DB lookup failures in mock tests without getSession
+      }
+    }
+
     const resp: GetSessionsResponse = {
-      sessions: (rawSessions || []).map((s) => ({
-        harness: s.harness,
-        harnessSessionId: s.harnessSessionId,
-        projectRoot: s.projectRoot,
-        updatedAt: s.updatedAt,
-        model: s.model || undefined,
-        summary: s.summary,
-        transcriptPath: s.transcriptPath || undefined,
-        asdSessionId: s.asdSessionId ?? null,
-        asdPhase: (s as any).asdPhase ?? null,
-        isPromotedToAsd: (s as any).isPromotedToAsd ?? Boolean(s.asdSessionId),
-      })),
+      sessions: (rawSessions || []).map((s) => {
+        const dbAutoApprove = s.asdSessionId
+          ? autoApproveBySessionId.get(s.asdSessionId)
+          : undefined;
+        const autoApprove =
+          dbAutoApprove !== undefined ? dbAutoApprove : (s as any).autoApprove;
+        return {
+          harness: s.harness,
+          harnessSessionId: s.harnessSessionId,
+          projectRoot: s.projectRoot,
+          updatedAt: s.updatedAt,
+          model: s.model || undefined,
+          summary: s.summary,
+          transcriptPath: s.transcriptPath || undefined,
+          asdSessionId: s.asdSessionId ?? null,
+          asdPhase: (s as any).asdPhase ?? null,
+          isPromotedToAsd: (s as any).isPromotedToAsd ?? Boolean(s.asdSessionId),
+          ...(autoApprove !== undefined ? { autoApprove } : {}),
+        };
+      }),
       activeSessionId,
     };
     sendJson(ctx.res, 200, resp);
@@ -57,6 +94,8 @@ export function createSessionRoute(ctx: RequestContext): void {
   const model = ctx.body?.model;
   const memo = ctx.body?.memo || ctx.body?.title || "";
   const makeForeground = Boolean(ctx.body?.makeForeground);
+  const autoApprove =
+    typeof ctx.body?.autoApprove === "boolean" ? ctx.body.autoApprove : true;
 
   try {
     const sessionId = ctx.deps.generateAsdSessionId();
@@ -68,6 +107,7 @@ export function createSessionRoute(ctx: RequestContext): void {
           projectRoot,
           mainHarness: harness,
           mainModel: model ?? null,
+          autoApprove,
           memo,
         });
         if (makeForeground) {
@@ -85,6 +125,7 @@ export function createSessionRoute(ctx: RequestContext): void {
       success: true,
       sessionId,
       phase: "planning",
+      autoApprove,
     };
     sendJson(ctx.res, 200, resp);
   } catch (err: unknown) {
@@ -310,6 +351,54 @@ export function setPhaseRoute(ctx: RequestContext): void {
       success: false,
       error: err instanceof Error ? err.message : String(err),
     } satisfies SetSessionPhaseResponse);
+  }
+}
+
+export function setAutoApproveRoute(ctx: RequestContext): void {
+  const projectRoot = ctx.body?.projectRoot || ctx.projectRoot;
+  const sessionId =
+    typeof ctx.body?.sessionId === "string" ? ctx.body.sessionId.trim() : "";
+  const autoApprove = ctx.body?.autoApprove;
+
+  if (!sessionId || typeof autoApprove !== "boolean") {
+    sendJson(ctx.res, 200, {
+      success: false,
+      sessionId: sessionId || "",
+      autoApprove: false,
+      error: "Missing or invalid sessionId or autoApprove",
+    } satisfies SetSessionAutoApproveResponse);
+    return;
+  }
+
+  try {
+    ctx.deps.withReadOnlyProjectDb(
+      projectRoot,
+      (db) => {
+        if (typeof db.getSession === "function") {
+          const existing = db.getSession(sessionId);
+          if (!existing) {
+            throw new Error(`Session not found: ${sessionId}`);
+          }
+        }
+        if (typeof (db as any).updateSessionHarnessInfo === "function") {
+          (db as any).updateSessionHarnessInfo(sessionId, { autoApprove });
+        }
+      },
+      ctx.homeDir
+    );
+
+    sendJson(ctx.res, 200, {
+      success: true,
+      sessionId,
+      autoApprove,
+    } satisfies SetSessionAutoApproveResponse);
+  } catch (err: unknown) {
+    sendJson(ctx.res, 200, {
+      success: false,
+      sessionId,
+      autoApprove: false,
+      error: err instanceof Error ? err.message : String(err),
+    } satisfies SetSessionAutoApproveResponse);
   }
 }
 

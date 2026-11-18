@@ -20,6 +20,7 @@ export const ORCHESTRATOR_EVENT_KINDS = [
   "status",
   "usage",
   "error",
+  "permission_request",
 ] as const;
 
 export type OrchestratorEventKind = (typeof ORCHESTRATOR_EVENT_KINDS)[number];
@@ -52,6 +53,21 @@ export interface TokenUsagePayload {
   costUsd?: number;
 }
 
+export interface PermissionOptionItem {
+  optionId: string;
+  name: string;
+  kind: string;
+}
+
+export interface PermissionRequestPayload {
+  requestId: string;
+  toolName: string;
+  toolKind?: string;
+  toolInput?: string;
+  locations?: string[];
+  options: PermissionOptionItem[];
+}
+
 /** Single normalized SSE event emitted on /api/turn/stream. */
 export interface OrchestratorEvent {
   kind: OrchestratorEventKind;
@@ -64,6 +80,7 @@ export interface OrchestratorEvent {
   toolResult?: ToolResultPayload;
   status?: OrchestratorTurnStatus;
   usage?: TokenUsagePayload;
+  permissionRequest?: PermissionRequestPayload;
   error?: string;
   timestamp?: string;
   raw?: unknown;
@@ -199,6 +216,7 @@ export interface DiscoveredSessionItem {
   asdSessionId?: string | null;
   asdPhase?: string | null;
   isPromotedToAsd: boolean;
+  autoApprove?: boolean;
 }
 
 export interface GetSessionsRequest {
@@ -300,12 +318,27 @@ export interface CreateSessionRequest {
   title?: string;
   memo?: string;
   makeForeground?: boolean;
+  autoApprove?: boolean;
 }
 
 export interface CreateSessionResponse {
   success: boolean;
   sessionId: string;
   phase: SessionPhase;
+  autoApprove?: boolean;
+  error?: string;
+}
+
+export interface SetSessionAutoApproveRequest {
+  projectRoot?: string;
+  sessionId: string;
+  autoApprove: boolean;
+}
+
+export interface SetSessionAutoApproveResponse {
+  success: boolean;
+  sessionId: string;
+  autoApprove: boolean;
   error?: string;
 }
 
@@ -397,6 +430,18 @@ export interface TurnCancelRequest {
 export interface TurnCancelResponse {
   success: boolean;
   message?: string;
+  error?: string;
+}
+
+export interface TurnPermissionDecisionRequest {
+  turnId: string;
+  requestId: string;
+  outcome: "selected" | "cancelled";
+  optionId?: string;
+}
+
+export interface TurnPermissionDecisionResponse {
+  success: boolean;
   error?: string;
 }
 

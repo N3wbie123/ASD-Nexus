@@ -11,19 +11,46 @@ import type {
   TurnStreamAccepted,
   TurnCancelRequest,
   TurnCancelResponse,
+  TurnPermissionDecisionRequest,
+  TurnPermissionDecisionResponse,
+  PermissionOptionItem,
+  PermissionRequestPayload,
   OrchestratorEvent,
 } from "../../shared/protocol.ts";
+
+type PermissionDecision =
+  | { outcome: "selected"; optionId: string }
+  | { outcome: "cancelled" };
+
+interface PendingPermissionEntry {
+  options: PermissionOptionItem[];
+  resolve: (decision: PermissionDecision) => void;
+}
 
 interface ActiveTurn {
   turnId: string;
   sessionId?: string;
   harness?: string;
+  projectRoot?: string;
+  autoApprove: boolean;
   abortController: AbortController;
   listeners: Array<(evt: OrchestratorEvent) => void>;
+  pendingPermissions: Map<string, PendingPermissionEntry>;
   ended: boolean;
 }
 
 const activeTurns = new Map<string, ActiveTurn>();
+
+function cancelPendingPermissions(turn: ActiveTurn): void {
+  for (const pending of turn.pendingPermissions.values()) {
+    try {
+      pending.resolve({ outcome: "cancelled" });
+    } catch {
+      // ignore settlement errors
+    }
+  }
+  turn.pendingPermissions.clear();
+}
 
 export function getActiveTurnCount(): number {
   return activeTurns.size;
@@ -31,6 +58,7 @@ export function getActiveTurnCount(): number {
 
 export function cancelAllActiveTurns(): void {
   for (const turn of activeTurns.values()) {
+    cancelPendingPermissions(turn);
     if (!turn.abortController.signal.aborted) {
       turn.abortController.abort();
     }
@@ -63,6 +91,7 @@ function setupTurnStream(
       turn.listeners.splice(idx, 1);
     }
     if (turn.listeners.length === 0 && !turn.abortController.signal.aborted && !turn.ended) {
+      cancelPendingPermissions(turn);
       turn.abortController.abort();
       activeTurns.delete(turn.turnId);
     }
@@ -88,8 +117,11 @@ export async function turnStreamRoute(ctx: RequestContext): Promise<void> {
     turnId,
     sessionId: body.sessionId,
     harness: body.harness,
+    projectRoot: body.projectRoot || ctx.projectRoot,
+    autoApprove: true,
     abortController,
     listeners: [],
+    pendingPermissions: new Map(),
     ended: false,
   };
   activeTurns.set(turnId, turn);
@@ -134,6 +166,8 @@ interface PreparedTurnContext {
   asdSessionId: string;
   harness: HarnessId;
   initialHarnessSessionId?: string;
+  autoApprove: boolean;
+  projectRoot: string;
 }
 
 function prepareTurnSessionAndDriver(
@@ -149,6 +183,7 @@ function prepareTurnSessionAndDriver(
     const source = body.source || "user";
 
     let asdSessionId: string;
+    let existingSessionRow: any = null;
     if (!rawSid) {
       asdSessionId = ctx.deps.generateAsdSessionId();
       db.createOrGetSession({
@@ -158,7 +193,7 @@ function prepareTurnSessionAndDriver(
         mainModel: requestedModel ?? null,
         memo: "",
       });
-    } else if (db.getSession(rawSid)) {
+    } else if ((existingSessionRow = db.getSession(rawSid))) {
       asdSessionId = rawSid;
     } else if (rawSid.startsWith("asd-") && ctx.deps.isValidAsdSessionId(rawSid)) {
       asdSessionId = rawSid;
@@ -173,6 +208,7 @@ function prepareTurnSessionAndDriver(
       const mapped = db.findSessionByHarnessSessionId?.(rawSid, requestedHarness);
       if (mapped) {
         asdSessionId = mapped.session_id;
+        existingSessionRow = mapped;
       } else {
         try {
           const promoted = ctx.deps.promoteCliSessionToAsd({
@@ -185,6 +221,9 @@ function prepareTurnSessionAndDriver(
             homeDir: ctx.homeDir,
           });
           asdSessionId = promoted.sessionId;
+          if (!promoted.created) {
+            existingSessionRow = db.getSession(asdSessionId) ?? null;
+          }
         } catch {
           asdSessionId = ctx.deps.isValidAsdSessionId(rawSid)
             ? rawSid
@@ -201,36 +240,68 @@ function prepareTurnSessionAndDriver(
     }
 
     const active = db.getActiveDriver(asdSessionId);
-    const effectiveHarness = (body.harness || active?.harness || "claude-code") as HarnessId;
-    let initialHarnessSessionId = active?.harness_session_id ?? undefined;
+    const lockedHarness = (active?.harness || existingSessionRow?.main_harness) as
+      | HarnessId
+      | undefined;
+    const isExistingOrStarted = Boolean(active || existingSessionRow);
+
+    let effectiveHarness: HarnessId;
+    if (isExistingOrStarted && lockedHarness) {
+      const requestedTrimmed = body.harness?.trim();
+      if (requestedTrimmed && requestedTrimmed !== lockedHarness) {
+        throw new Error(
+          `HARNESS_IMMUTABLE: Session ${asdSessionId} is locked to harness '${lockedHarness}' and cannot switch to '${requestedTrimmed}'`
+        );
+      }
+      effectiveHarness = lockedHarness;
+    } else {
+      effectiveHarness = (body.harness?.trim() || active?.harness || "claude-code") as HarnessId;
+    }
+
+    let initialHarnessSessionId =
+      active?.harness_session_id ?? existingSessionRow?.harness_session_id ?? undefined;
 
     if (
       !active ||
       active.harness !== effectiveHarness ||
       (requestedModel !== undefined && requestedModel !== (active.model ?? undefined))
     ) {
+      const preservedHarnessSessionId =
+        active && active.harness === effectiveHarness
+          ? active.harness_session_id ?? existingSessionRow?.harness_session_id ?? null
+          : isExistingOrStarted
+            ? existingSessionRow?.harness_session_id ?? null
+            : null;
       const attached = ctx.deps.attachDriver(db, {
         projectRoot,
         sessionId: asdSessionId,
         harness: effectiveHarness,
         model:
           requestedModel ??
-          (active?.harness === effectiveHarness ? active.model : null) ??
+          (active?.harness === effectiveHarness ? active.model : undefined) ??
+          existingSessionRow?.main_model ??
           null,
-        harnessSessionId:
-          active && active.harness === effectiveHarness
-            ? active.harness_session_id ?? null
-            : null,
+        harnessSessionId: preservedHarnessSessionId,
         source,
       });
       initialHarnessSessionId = attached?.driver?.harness_session_id ?? initialHarnessSessionId;
     }
+
+    const sessionRow = db.getSession?.(asdSessionId) ?? existingSessionRow;
+    const autoApprove =
+      sessionRow?.auto_approve !== undefined
+        ? sessionRow.auto_approve !== 0
+        : typeof sessionRow?.autoApprove === "boolean"
+          ? sessionRow.autoApprove
+          : true;
 
     return {
       db,
       asdSessionId,
       harness: effectiveHarness,
       initialHarnessSessionId,
+      autoApprove,
+      projectRoot,
     };
   } catch (err) {
     try {
@@ -240,6 +311,104 @@ function prepareTurnSessionAndDriver(
     }
     throw err;
   }
+}
+
+function pickAutoApproveOptionId(options: PermissionOptionItem[]): string | undefined {
+  const allowOnce = options.find((opt) => opt.kind === "allow_once");
+  if (allowOnce) return allowOnce.optionId;
+  const allowAlways = options.find((opt) => opt.kind === "allow_always");
+  if (allowAlways) return allowAlways.optionId;
+  const anyAllow = options.find((opt) => opt.kind.startsWith("allow"));
+  if (anyAllow) return anyAllow.optionId;
+  return options[0]?.optionId;
+}
+
+function normalizePermissionParams(
+  acpParams: any
+): Omit<PermissionRequestPayload, "requestId"> & { requestId?: string } {
+  const rawInput = acpParams?.toolCall?.rawInput ?? acpParams?.toolInput;
+  const toolInput =
+    rawInput === undefined
+      ? undefined
+      : typeof rawInput === "string"
+        ? rawInput
+        : JSON.stringify(rawInput);
+
+  const rawLocations = acpParams?.toolCall?.locations ?? acpParams?.locations;
+  const locations = Array.isArray(rawLocations)
+    ? rawLocations
+        .map((loc: any) => (typeof loc === "string" ? loc : loc?.path))
+        .filter((p: unknown): p is string => typeof p === "string" && p.length > 0)
+    : undefined;
+
+  const rawOptions = Array.isArray(acpParams?.options) ? acpParams.options : [];
+  const options: PermissionOptionItem[] = rawOptions
+    .filter((opt: any) => opt && typeof opt.optionId === "string")
+    .map((opt: any) => ({
+      optionId: String(opt.optionId),
+      name: typeof opt.name === "string" ? opt.name : String(opt.optionId),
+      kind: typeof opt.kind === "string" ? opt.kind : "allow_once",
+    }));
+
+  const toolKind = acpParams?.toolCall?.kind || acpParams?.toolKind;
+  return {
+    ...(typeof acpParams?.requestId === "string" && acpParams.requestId
+      ? { requestId: acpParams.requestId }
+      : {}),
+    toolName:
+      acpParams?.toolCall?.title ||
+      acpParams?.toolCall?.kind ||
+      acpParams?.toolName ||
+      "tool",
+    ...(typeof toolKind === "string" && toolKind ? { toolKind } : {}),
+    ...(toolInput !== undefined ? { toolInput } : {}),
+    ...(locations && locations.length > 0 ? { locations } : {}),
+    options,
+  };
+}
+
+export function requestTurnPermission(
+  turnId: string,
+  input: Omit<PermissionRequestPayload, "requestId"> & { requestId?: string }
+): Promise<PermissionDecision> {
+  const turn = activeTurns.get(turnId);
+  if (!turn || turn.ended || turn.abortController.signal.aborted) {
+    return Promise.resolve({ outcome: "cancelled" });
+  }
+
+  if (turn.autoApprove) {
+    const optionId = pickAutoApproveOptionId(input.options || []);
+    if (optionId) {
+      return Promise.resolve({ outcome: "selected", optionId });
+    }
+    return Promise.resolve({ outcome: "cancelled" });
+  }
+
+  const requestId =
+    input.requestId || `perm_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const payload: PermissionRequestPayload = {
+    requestId,
+    toolName: input.toolName,
+    ...(input.toolKind !== undefined ? { toolKind: input.toolKind } : {}),
+    ...(input.toolInput !== undefined ? { toolInput: input.toolInput } : {}),
+    ...(input.locations !== undefined ? { locations: input.locations } : {}),
+    options: input.options,
+  };
+
+  return new Promise<PermissionDecision>((resolve) => {
+    turn.pendingPermissions.set(requestId, {
+      options: input.options,
+      resolve,
+    });
+    broadcastEvent(turn, {
+      kind: "permission_request",
+      turnId: turn.turnId,
+      sessionId: turn.sessionId,
+      harness: turn.harness,
+      permissionRequest: payload,
+      timestamp: new Date().toISOString(),
+    });
+  });
 }
 
 async function executeTurn(
@@ -265,6 +434,8 @@ async function executeTurn(
     prepared = prepareTurnSessionAndDriver(ctx, projectRoot, body);
     turn.sessionId = prepared.asdSessionId;
     turn.harness = prepared.harness;
+    turn.projectRoot = prepared.projectRoot;
+    turn.autoApprove = prepared.autoApprove;
 
     const initialEvent: OrchestratorEvent = {
       kind: "status",
@@ -320,8 +491,16 @@ async function executeTurn(
       prompt: resolvedSlash.prompt,
       model: body.model,
       streamJson: body.streaming ?? true,
+      autoApprove: prepared.autoApprove,
       signal: turn.abortController.signal,
       homeDir: ctx.homeDir,
+      onPermissionRequest: async (acpParams: any) => {
+        const decision = await requestTurnPermission(
+          turn.turnId,
+          normalizePermissionParams(acpParams)
+        );
+        return { outcome: decision };
+      },
       onOutput: (chunk: string) => {
         sawRawOutput = true;
         forwardNormalizedEvents(rawNormalizer.pushChunk(chunk));
@@ -415,6 +594,7 @@ async function executeTurn(
     }
   } finally {
     closeDb();
+    cancelPendingPermissions(turn);
     turn.ended = true;
     activeTurns.delete(turn.turnId);
     if (!ctx.res.writableEnded) {
@@ -445,6 +625,7 @@ export function turnCancelRoute(ctx: RequestContext): void {
 
   const turn = activeTurns.get(turnId);
   if (turn) {
+    cancelPendingPermissions(turn);
     turn.abortController.abort();
     broadcastEvent(turn, {
       kind: "status",
@@ -467,4 +648,91 @@ export function turnCancelRoute(ctx: RequestContext): void {
     success: true,
     message: "Turn was not active or already finished",
   } satisfies TurnCancelResponse);
+}
+
+export function turnPermissionRoute(ctx: RequestContext): void {
+  const body = (ctx.body || {}) as Partial<TurnPermissionDecisionRequest>;
+  const turnId = typeof body.turnId === "string" ? body.turnId.trim() : "";
+  const requestId = typeof body.requestId === "string" ? body.requestId.trim() : "";
+  const outcome = body.outcome;
+
+  if (!turnId || !requestId) {
+    sendJson(ctx.res, 200, {
+      success: false,
+      error: "Missing turnId or requestId",
+    } satisfies TurnPermissionDecisionResponse);
+    return;
+  }
+
+  if (outcome !== "selected" && outcome !== "cancelled") {
+    sendJson(ctx.res, 200, {
+      success: false,
+      error: "Invalid permission outcome",
+    } satisfies TurnPermissionDecisionResponse);
+    return;
+  }
+
+  const turn = activeTurns.get(turnId);
+  if (!turn || turn.ended) {
+    sendJson(ctx.res, 200, {
+      success: false,
+      error: `Active turn not found: ${turnId}`,
+    } satisfies TurnPermissionDecisionResponse);
+    return;
+  }
+
+  const pending = turn.pendingPermissions.get(requestId);
+  if (!pending) {
+    sendJson(ctx.res, 200, {
+      success: false,
+      error: `Pending permission request not found: ${requestId}`,
+    } satisfies TurnPermissionDecisionResponse);
+    return;
+  }
+
+  if (outcome === "selected") {
+    const optionId = typeof body.optionId === "string" ? body.optionId.trim() : "";
+    if (!optionId) {
+      sendJson(ctx.res, 200, {
+        success: false,
+        error: "Missing optionId for selected outcome",
+      } satisfies TurnPermissionDecisionResponse);
+      return;
+    }
+
+    const chosenOption = pending.options.find((opt) => opt.optionId === optionId);
+    if (chosenOption?.kind === "allow_always") {
+      turn.autoApprove = true;
+      if (turn.sessionId && turn.projectRoot) {
+        try {
+          ctx.deps.withReadOnlyProjectDb(
+            turn.projectRoot,
+            (db) => {
+              if (typeof (db as any).updateSessionHarnessInfo === "function") {
+                (db as any).updateSessionHarnessInfo(turn.sessionId, {
+                  autoApprove: true,
+                });
+              }
+            },
+            ctx.homeDir
+          );
+        } catch {
+          // Best-effort persistence
+        }
+      }
+    }
+
+    turn.pendingPermissions.delete(requestId);
+    pending.resolve({ outcome: "selected", optionId });
+    sendJson(ctx.res, 200, {
+      success: true,
+    } satisfies TurnPermissionDecisionResponse);
+    return;
+  }
+
+  turn.pendingPermissions.delete(requestId);
+  pending.resolve({ outcome: "cancelled" });
+  sendJson(ctx.res, 200, {
+    success: true,
+  } satisfies TurnPermissionDecisionResponse);
 }
