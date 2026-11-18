@@ -19,6 +19,7 @@ pub enum OrchestratorEventKind {
     Status,
     Usage,
     Error,
+    PermissionRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -64,6 +65,29 @@ pub struct TokenUsagePayload {
     pub cost_usd: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionOptionItem {
+    pub option_id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRequestPayload {
+    pub request_id: String,
+    pub tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_input: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locations: Option<Vec<String>>,
+    #[serde(default)]
+    pub options: Vec<PermissionOptionItem>,
+}
+
 /// Single normalized SSE event emitted on /api/turn/stream.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +111,8 @@ pub struct OrchestratorEvent {
     pub status: Option<OrchestratorTurnStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsagePayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_request: Option<PermissionRequestPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,6 +300,8 @@ pub struct DiscoveredSessionItem {
     pub asd_phase: Option<String>,
     #[serde(default)]
     pub is_promoted_to_asd: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -450,6 +478,8 @@ pub struct CreateSessionRequest {
     pub memo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub make_foreground: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,6 +488,27 @@ pub struct CreateSessionResponse {
     pub success: bool,
     pub session_id: String,
     pub phase: SessionPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionAutoApproveRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+    pub session_id: String,
+    pub auto_approve: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionAutoApproveResponse {
+    pub success: bool,
+    pub session_id: String,
+    pub auto_approve: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -586,6 +637,24 @@ pub struct TurnCancelResponse {
     pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnPermissionDecisionRequest {
+    pub turn_id: String,
+    pub request_id: String,
+    pub outcome: String, // "selected" | "cancelled"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnPermissionDecisionResponse {
+    pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1106,6 +1175,7 @@ mod tests {
                 total_tokens: Some(150),
                 cost_usd: Some(0.002),
             }),
+            permission_request: None,
             error: None,
             timestamp: Some("2026-11-13T09:00:00Z".into()),
             raw: None,
@@ -1217,5 +1287,126 @@ mod tests {
         assert!(fs_json.contains("\"isDir\":false"));
         let fs_de: FsListResponse = serde_json::from_str(&fs_json).unwrap();
         assert_eq!(fs_resp, fs_de);
+    }
+
+    #[test]
+    fn test_permission_request_event_roundtrip() {
+        let event = OrchestratorEvent {
+            kind: OrchestratorEventKind::PermissionRequest,
+            session_id: Some("s_perm".into()),
+            turn_id: Some("t_perm".into()),
+            harness: Some("claude-code".into()),
+            text: None,
+            thinking: None,
+            tool_use: None,
+            tool_result: None,
+            status: None,
+            usage: None,
+            permission_request: Some(PermissionRequestPayload {
+                request_id: "req_1".into(),
+                tool_name: "Bash".into(),
+                tool_kind: Some("execute".into()),
+                tool_input: Some("{\"command\":\"ls\"}".into()),
+                locations: Some(vec!["src/main.rs".into()]),
+                options: vec![
+                    PermissionOptionItem {
+                        option_id: "allow_once".into(),
+                        name: "Allow once".into(),
+                        kind: "allow_once".into(),
+                    },
+                    PermissionOptionItem {
+                        option_id: "reject_once".into(),
+                        name: "Reject".into(),
+                        kind: "reject_once".into(),
+                    },
+                ],
+            }),
+            error: None,
+            timestamp: Some("2026-11-18T07:50:00Z".into()),
+            raw: None,
+        };
+
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(json.contains("\"kind\":\"permission_request\""));
+        assert!(json.contains("\"permissionRequest\":"));
+        assert!(json.contains("\"requestId\":\"req_1\""));
+        assert!(json.contains("\"toolName\":\"Bash\""));
+        assert!(json.contains("\"optionId\":\"allow_once\""));
+
+        let deserialized: OrchestratorEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn test_auto_approve_and_permission_decision_roundtrip() {
+        let create_req = CreateSessionRequest {
+            project_root: Some("C:/repo".into()),
+            harness: Some("claude-code".into()),
+            auto_approve: Some(false),
+            ..Default::default()
+        };
+        let create_req_json = serde_json::to_string(&create_req).unwrap();
+        assert!(create_req_json.contains("\"autoApprove\":false"));
+        let create_req_de: CreateSessionRequest = serde_json::from_str(&create_req_json).unwrap();
+        assert_eq!(create_req, create_req_de);
+
+        let create_resp = CreateSessionResponse {
+            success: true,
+            session_id: "s_1".into(),
+            phase: SessionPhase::Planning,
+            auto_approve: Some(false),
+            error: None,
+        };
+        let create_resp_json = serde_json::to_string(&create_resp).unwrap();
+        assert!(create_resp_json.contains("\"autoApprove\":false"));
+        let create_resp_de: CreateSessionResponse =
+            serde_json::from_str(&create_resp_json).unwrap();
+        assert_eq!(create_resp, create_resp_de);
+
+        let auto_req = SetSessionAutoApproveRequest {
+            project_root: Some("C:/repo".into()),
+            session_id: "s_1".into(),
+            auto_approve: true,
+        };
+        let auto_req_json = serde_json::to_string(&auto_req).unwrap();
+        assert!(auto_req_json.contains("\"sessionId\":\"s_1\""));
+        assert!(auto_req_json.contains("\"autoApprove\":true"));
+        let auto_req_de: SetSessionAutoApproveRequest =
+            serde_json::from_str(&auto_req_json).unwrap();
+        assert_eq!(auto_req, auto_req_de);
+
+        let auto_resp = SetSessionAutoApproveResponse {
+            success: true,
+            session_id: "s_1".into(),
+            auto_approve: true,
+            error: None,
+        };
+        let auto_resp_json = serde_json::to_string(&auto_resp).unwrap();
+        let auto_resp_de: SetSessionAutoApproveResponse =
+            serde_json::from_str(&auto_resp_json).unwrap();
+        assert_eq!(auto_resp, auto_resp_de);
+
+        let perm_req = TurnPermissionDecisionRequest {
+            turn_id: "t_1".into(),
+            request_id: "req_1".into(),
+            outcome: "selected".into(),
+            option_id: Some("allow_once".into()),
+        };
+        let perm_req_json = serde_json::to_string(&perm_req).unwrap();
+        assert!(perm_req_json.contains("\"turnId\":\"t_1\""));
+        assert!(perm_req_json.contains("\"requestId\":\"req_1\""));
+        assert!(perm_req_json.contains("\"optionId\":\"allow_once\""));
+        let perm_req_de: TurnPermissionDecisionRequest =
+            serde_json::from_str(&perm_req_json).unwrap();
+        assert_eq!(perm_req, perm_req_de);
+
+        let perm_resp = TurnPermissionDecisionResponse {
+            success: true,
+            error: None,
+        };
+        let perm_resp_json = serde_json::to_string(&perm_resp).unwrap();
+        let perm_resp_de: TurnPermissionDecisionResponse =
+            serde_json::from_str(&perm_resp_json).unwrap();
+        assert_eq!(perm_resp, perm_resp_de);
     }
 }

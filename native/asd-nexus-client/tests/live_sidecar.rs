@@ -5,9 +5,9 @@
 //! and ensures clean child termination on Drop.
 
 use asd_nexus_client::{
-    find_server_script, FsListMode, FsListRequest, GetHarnessCommandsRequest,
-    HarnessCommandSource, ListProjectsRequest, SidecarConfig, SidecarManager,
-    SIDECAR_READY_PROTOCOL,
+    find_server_script, CreateSessionRequest, DeleteSessionRequest, FsListMode, FsListRequest,
+    GetHarnessCommandsRequest, HarnessCommandSource, ListProjectsRequest,
+    SetSessionAutoApproveRequest, SidecarConfig, SidecarManager, SIDECAR_READY_PROTOCOL,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -107,7 +107,42 @@ fn test_live_sidecar_lifecycle_and_rest_calls() {
         "Expected 'src' directory in fs_list dirs response"
     );
 
-    // 6. Clean shutdown & drop
+    // 6. Session create with autoApprove=false and toggle via set_session_auto_approve
+    let root_str = project_root.to_string_lossy().into_owned();
+    let created = client
+        .create_session(&CreateSessionRequest {
+            project_root: Some(root_str.clone()),
+            harness: Some("claude-code".into()),
+            title: Some("live-sidecar-auto-approve-test".into()),
+            make_foreground: Some(false),
+            auto_approve: Some(false),
+            ..Default::default()
+        })
+        .expect("POST /api/sessions failed");
+    assert!(created.success, "create_session failed: {:?}", created.error);
+    assert!(!created.session_id.is_empty());
+    assert_eq!(created.auto_approve, Some(false));
+
+    let toggled = client
+        .set_session_auto_approve(&SetSessionAutoApproveRequest {
+            project_root: Some(root_str.clone()),
+            session_id: created.session_id.clone(),
+            auto_approve: true,
+        })
+        .expect("POST /api/sessions/auto-approve failed");
+    assert!(toggled.success, "set_session_auto_approve failed: {:?}", toggled.error);
+    assert_eq!(toggled.session_id, created.session_id);
+    assert!(toggled.auto_approve);
+
+    let deleted = client
+        .delete_session(&DeleteSessionRequest {
+            project_root: root_str,
+            session_id: created.session_id,
+        })
+        .expect("POST /api/sessions/delete failed");
+    assert!(deleted.success, "delete_session cleanup failed: {:?}", deleted.error);
+
+    // 7. Clean shutdown & drop
     let child_pid = ready.pid;
     drop(client);
     sidecar.shutdown().expect("Shutdown failed");

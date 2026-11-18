@@ -244,6 +244,14 @@ impl NexusClient {
         self.post_json(&url, req)
     }
 
+    pub fn set_session_auto_approve(
+        &self,
+        req: &SetSessionAutoApproveRequest,
+    ) -> Result<SetSessionAutoApproveResponse> {
+        let url = format!("{}/api/sessions/auto-approve", self.base_url);
+        self.post_json(&url, req)
+    }
+
     pub fn resume_command(
         &self,
         session_id: &str,
@@ -379,6 +387,14 @@ impl NexusClient {
 
     pub fn cancel_turn(&self, req: &TurnCancelRequest) -> Result<TurnCancelResponse> {
         let url = format!("{}/api/turn/cancel", self.base_url);
+        self.post_json(&url, req)
+    }
+
+    pub fn submit_turn_permission(
+        &self,
+        req: &TurnPermissionDecisionRequest,
+    ) -> Result<TurnPermissionDecisionResponse> {
+        let url = format!("{}/api/turn/permission", self.base_url);
         self.post_json(&url, req)
     }
 
@@ -609,5 +625,31 @@ impl TurnStreamHandle {
             turn_id,
             session_id: self.session_id.clone(),
         })
+    }
+
+    /// Submit a permission decision for a pending tool call in this turn via `POST /api/turn/permission`.
+    pub fn submit_permission(
+        &self,
+        request_id: &str,
+        outcome: &str,
+        option_id: Option<String>,
+    ) -> Result<TurnPermissionDecisionResponse> {
+        let turn_id = match self.turn_id() {
+            Some(id) => id,
+            None => {
+                return Ok(TurnPermissionDecisionResponse {
+                    success: false,
+                    error: Some("Turn ID has not been assigned by the server yet".into()),
+                });
+            }
+        };
+
+        self.client
+            .submit_turn_permission(&TurnPermissionDecisionRequest {
+                turn_id,
+                request_id: request_id.to_string(),
+                outcome: outcome.to_string(),
+                option_id,
+            })
     }
 }

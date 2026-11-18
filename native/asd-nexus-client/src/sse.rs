@@ -222,4 +222,39 @@ mod tests {
         assert_eq!(finish_msgs.len(), 1);
         assert_eq!(finish_msgs[0], StreamMessage::Done);
     }
+
+    #[test]
+    fn test_sse_permission_request_event() {
+        let mut parser = SseParser::new();
+        let payload = concat!(
+            "data: {\"kind\":\"permission_request\",\"sessionId\":\"s_1\",\"turnId\":\"t_1\",",
+            "\"permissionRequest\":{\"requestId\":\"req_42\",\"toolName\":\"Write\",",
+            "\"toolKind\":\"edit\",\"toolInput\":\"{\\\"path\\\":\\\"foo.rs\\\"}\",",
+            "\"locations\":[\"foo.rs\"],",
+            "\"options\":[{\"optionId\":\"allow_once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"}]}}\n\n"
+        );
+        let msgs = parser.feed(payload.as_bytes());
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            StreamMessage::Event(evt) => {
+                assert_eq!(evt.kind, OrchestratorEventKind::PermissionRequest);
+                assert_eq!(evt.session_id.as_deref(), Some("s_1"));
+                assert_eq!(evt.turn_id.as_deref(), Some("t_1"));
+                let pr = evt
+                    .permission_request
+                    .as_ref()
+                    .expect("permissionRequest payload");
+                assert_eq!(pr.request_id, "req_42");
+                assert_eq!(pr.tool_name, "Write");
+                assert_eq!(pr.tool_kind.as_deref(), Some("edit"));
+                assert_eq!(pr.tool_input.as_deref(), Some("{\"path\":\"foo.rs\"}"));
+                assert_eq!(pr.locations.as_deref(), Some(&["foo.rs".to_string()][..]));
+                assert_eq!(pr.options.len(), 1);
+                assert_eq!(pr.options[0].option_id, "allow_once");
+                assert_eq!(pr.options[0].name, "Allow once");
+                assert_eq!(pr.options[0].kind, "allow_once");
+            }
+            other => panic!("Expected Event, got {other:?}"),
+        }
+    }
 }
