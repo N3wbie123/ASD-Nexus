@@ -984,6 +984,102 @@ pub struct TerminalOpenResponse {
     pub error: Option<String>,
 }
 
+// ============================================================================
+// Harness Slash Commands & Skills Discovery
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessCommandSource {
+    Builtin,
+    Global,
+    Project,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessCommandKind {
+    Command,
+    Skill,
+    Workflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCommandItem {
+    pub name: String,
+    pub description: String,
+    pub harness: String,
+    pub source: HarnessCommandSource,
+    pub kind: HarnessCommandKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GetHarnessCommandsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetHarnessCommandsResponse {
+    pub commands: Vec<HarnessCommandItem>,
+}
+
+// ============================================================================
+// Workspace Files & Directories Listing (GET /api/fs/list)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsListMode {
+    Files,
+    Dirs,
+}
+
+impl Default for FsListMode {
+    fn default() -> Self {
+        Self::Files
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsListEntry {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FsListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<FsListMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsListResponse {
+    pub project_root: String,
+    pub mode: FsListMode,
+    pub base_dir: String,
+    pub entries: Vec<FsListEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,5 +1184,38 @@ mod tests {
         };
         let term_json = serde_json::to_string(&term).unwrap();
         assert!(term_json.contains("\"cliString\""));
+
+        let cmds = GetHarnessCommandsResponse {
+            commands: vec![HarnessCommandItem {
+                name: "compact".into(),
+                description: "Compact context".into(),
+                harness: "claude-code".into(),
+                source: HarnessCommandSource::Builtin,
+                kind: HarnessCommandKind::Command,
+                path: None,
+            }],
+        };
+        let cmds_json = serde_json::to_string(&cmds).unwrap();
+        assert!(cmds_json.contains("\"source\":\"builtin\""));
+        assert!(cmds_json.contains("\"kind\":\"command\""));
+        let cmds_de: GetHarnessCommandsResponse = serde_json::from_str(&cmds_json).unwrap();
+        assert_eq!(cmds, cmds_de);
+
+        let fs_resp = FsListResponse {
+            project_root: "C:/repo".into(),
+            mode: FsListMode::Files,
+            base_dir: "C:/repo".into(),
+            entries: vec![FsListEntry {
+                path: "src/main.rs".into(),
+                name: "main.rs".into(),
+                is_dir: false,
+            }],
+            truncated: Some(false),
+        };
+        let fs_json = serde_json::to_string(&fs_resp).unwrap();
+        assert!(fs_json.contains("\"projectRoot\":\"C:/repo\""));
+        assert!(fs_json.contains("\"isDir\":false"));
+        let fs_de: FsListResponse = serde_json::from_str(&fs_json).unwrap();
+        assert_eq!(fs_resp, fs_de);
     }
 }

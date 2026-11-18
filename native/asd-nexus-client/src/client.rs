@@ -524,6 +524,51 @@ impl NexusClient {
         let url = format!("{}/api/terminal/open", self.base_url);
         self.post_json(&url, req)
     }
+
+    // ========================================================================
+    // Harness Commands & Workspace FS List
+    // ========================================================================
+
+    pub fn harness_commands(
+        &self,
+        req: &GetHarnessCommandsRequest,
+    ) -> Result<GetHarnessCommandsResponse> {
+        let mut url = Url::parse(&format!("{}/api/harness-commands", self.base_url))?;
+        {
+            let mut q = url.query_pairs_mut();
+            if let Some(ref harness) = req.harness {
+                q.append_pair("harness", harness);
+            }
+            if let Some(ref root) = req.project_root {
+                q.append_pair("projectRoot", root);
+            }
+        }
+        self.get_json(url.as_str())
+    }
+
+    pub fn fs_list(&self, req: &FsListRequest) -> Result<FsListResponse> {
+        let mut url = Url::parse(&format!("{}/api/fs/list", self.base_url))?;
+        {
+            let mut q = url.query_pairs_mut();
+            if let Some(ref root) = req.project_root {
+                q.append_pair("projectRoot", root);
+            }
+            if let Some(mode) = req.mode {
+                let mode_str = match mode {
+                    FsListMode::Files => "files",
+                    FsListMode::Dirs => "dirs",
+                };
+                q.append_pair("mode", mode_str);
+            }
+            if let Some(ref prefix) = req.prefix {
+                q.append_pair("prefix", prefix);
+            }
+            if let Some(limit) = req.limit {
+                q.append_pair("limit", &limit.to_string());
+            }
+        }
+        self.get_json(url.as_str())
+    }
 }
 
 /// Handle for monitoring or canceling an ongoing turn stream.

@@ -1,17 +1,22 @@
-//! Interactive TUI application state and key handling.
+//! Interactive TUI application state, OpenCode slash/file/shell UX, and pure key/mouse handling.
 //!
-//! Key handling is pure: it mutates UI state and queues [`Action`]s, which are
-//! executed against the sidecar by [`crate::exec`]. This keeps every key path
-//! testable without a server.
+//! Key and mouse handling are pure: they mutate UI state and queue [`Action`]s,
+//! which are executed against the sidecar by [`crate::exec`]. This keeps every
+//! interaction path deterministically testable without a live server.
 
+use std::cell::RefCell;
+use std::path::Path;
+use std::process::Command as ProcessCommand;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use asd_nexus_client::*;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 use crate::textarea::TextArea;
-use crate::timeline::Timeline;
+use crate::theme::{self, ThemeMode};
+use crate::timeline::{Entry, Timeline};
 
 pub const HARNESSES: [&str; 5] = ["claude-code", "codex", "opencode", "antigravity", "cursor"];
 pub const PHASES: [SessionPhase; 4] = [
@@ -40,6 +45,9 @@ pub enum Overlay {
     Routing,
     Terminal,
     ModelPicker,
+    Sessions,
+    DirPicker,
+    CommandPalette,
     Help,
 }
 
@@ -80,6 +88,42 @@ pub struct Prompt {
     pub buffer: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandBadge {
+    Nexus,
+    Harness(String),
+}
+
+impl CommandBadge {
+    pub fn label(&self) -> String {
+        match self {
+            CommandBadge::Nexus => "[nexus]".into(),
+            CommandBadge::Harness(h) => format!("[{h}]"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashCommandEntry {
+    pub name: String,
+    pub usage: String,
+    pub description: String,
+    pub badge: CommandBadge,
+    pub is_builtin: bool,
+    pub kind_label: &'static str,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UiRegions {
+    pub popup_rect: Option<Rect>,
+    /// `(terminal_row_y, item_index)` for active `/` or `@` popup.
+    pub popup_rows: Vec<(u16, usize)>,
+    pub timeline_rect: Option<Rect>,
+    /// `(start_y, end_y_exclusive, entry_index)` for visible timeline entries.
+    pub timeline_entries: Vec<(u16, u16, usize)>,
+    pub input_rect: Option<Rect>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     LoadInitial,
@@ -96,6 +140,10 @@ pub enum Action {
     SetForeground(String),
     SetPhase { session_id: String, phase: SessionPhase },
     RefreshModels { force: bool },
+    RefreshHarnessCommands,
+    ListFiles { prefix: Option<String> },
+    ListDirs { prefix: Option<String> },
+    RunShell(String),
     SendPrompt(String),
     CancelTurn,
     RefreshBoard,
@@ -121,12 +169,35 @@ pub struct ActiveStream {
     pub rx: Receiver<StreamMessage>,
 }
 
+const BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[
+    ("sessions", "/sessions", "Open session explorer modal (alias: /s)"),
+    ("s", "/s", "Open session explorer modal"),
+    ("cd", "/cd [path]", "Switch project directory or open directory picker"),
+    ("new", "/new [title]", "Create and open a new session in current harness"),
+    ("models", "/models", "Open harness & model picker modal (Ctrl+K)"),
+    ("harness", "/harness [name]", "Switch active harness (Tab)"),
+    ("board", "/board", "Open ASD progress board & PLAN.md (Ctrl+B)"),
+    ("diff", "/diff", "Open worktree diff & review modal (Ctrl+D)"),
+    ("subagents", "/subagents", "Open subagents & live log tail modal (Ctrl+L)"),
+    ("routing", "/routing", "Open multi-harness routing config modal (Ctrl+R)"),
+    ("terminal", "/terminal", "Open interactive resume / OS terminal modal (Ctrl+T)"),
+    ("theme", "/theme", "Toggle DarkColor / Monochrome theme"),
+    ("sidebar", "/sidebar", "Toggle left projects & sessions drawer"),
+    ("clear", "/clear", "Clear current conversation timeline"),
+    ("help", "/help", "Show keyboard & slash command reference (F1)"),
+    ("exit", "/exit", "Quit ASD-Nexus CLI (alias: /quit, Ctrl+Q)"),
+    ("quit", "/quit", "Quit ASD-Nexus CLI"),
+];
+
 pub struct App {
     pub project_root: String,
     pub harness: String,
     pub model: Option<String>,
     pub cli_session: Option<String>,
     pub server_label: String,
+
+    pub theme_mode: ThemeMode,
+    pub sidebar_open: bool,
 
     pub focus: Focus,
     pub overlay: Option<Overlay>,
@@ -153,9 +224,27 @@ pub struct App {
     pub picker_query: String,
     pub picker_sel: usize,
 
+    pub harness_commands: Vec<HarnessCommandItem>,
+    pub slash_sel: usize,
+    pub popup_dismissed: bool,
+
+    pub file_candidates: Vec<FsListEntry>,
+    pub file_sel: usize,
+    pub file_popup_open: bool,
+    pub last_file_prefix: Option<Option<String>>,
+
+    pub dir_candidates: Vec<FsListEntry>,
+    pub dir_query: String,
+    pub dir_sel: usize,
+
+    pub palette_query: String,
+    pub palette_sel: usize,
+
     pub timeline: Timeline,
     pub timeline_sel: usize,
+    pub timeline_scroll: Option<usize>,
     pub input: String,
+    pub input_area: TextArea,
     pub stream: Option<ActiveStream>,
 
     pub board: Option<GetBoardResponse>,
@@ -180,6 +269,7 @@ pub struct App {
     pub terminal_kind: usize,
 
     pub last_poll: Option<Instant>,
+    pub ui_regions: RefCell<UiRegions>,
 }
 
 fn ctrl(k: &KeyEvent, c: char) -> bool {
@@ -205,18 +295,21 @@ impl App {
     pub fn new(project_root: impl Into<String>, harness: impl Into<String>, model: Option<String>) -> Self {
         let harness = harness.into();
         let picker_harness = HARNESSES.iter().position(|h| *h == harness).unwrap_or(0);
+        theme::set_mode(ThemeMode::DarkColor);
         Self {
             project_root: project_root.into(),
             harness,
             model,
             cli_session: None,
             server_label: String::new(),
-            focus: Focus::Sessions,
+            theme_mode: ThemeMode::DarkColor,
+            sidebar_open: false,
+            focus: Focus::Input,
             overlay: None,
             prompt: None,
             confirm: None,
             pending: vec![Action::LoadInitial],
-            status: "Ready. F1 = help".into(),
+            status: "Ready · / commands · @ files · ! shell · Ctrl+P palette".into(),
             should_quit: false,
             projects: vec![],
             project_sel: 0,
@@ -231,9 +324,23 @@ impl App {
             picker_harness,
             picker_query: String::new(),
             picker_sel: 0,
+            harness_commands: vec![],
+            slash_sel: 0,
+            popup_dismissed: false,
+            file_candidates: vec![],
+            file_sel: 0,
+            file_popup_open: false,
+            last_file_prefix: None,
+            dir_candidates: vec![],
+            dir_query: String::new(),
+            dir_sel: 0,
+            palette_query: String::new(),
+            palette_sel: 0,
             timeline: Timeline::default(),
             timeline_sel: 0,
+            timeline_scroll: None,
             input: String::new(),
+            input_area: TextArea::new(),
             stream: None,
             board: None,
             board_sel: 0,
@@ -252,6 +359,7 @@ impl App {
             resume: None,
             terminal_kind: 1,
             last_poll: None,
+            ui_regions: RefCell::new(UiRegions::default()),
         }
     }
 
@@ -267,6 +375,22 @@ impl App {
         self.status = s.into();
     }
 
+    pub fn set_theme_mode(&mut self, mode: ThemeMode) {
+        self.theme_mode = mode;
+        theme::set_mode(mode);
+        self.set_status(format!("Theme: {}", mode.name()));
+    }
+
+    pub fn toggle_theme(&mut self) -> ThemeMode {
+        let next = self.theme_mode.toggle();
+        self.set_theme_mode(next);
+        next
+    }
+
+    pub fn is_home(&self) -> bool {
+        self.timeline.entries.is_empty()
+    }
+
     pub fn is_streaming(&self) -> bool {
         self.stream.is_some() || self.timeline.streaming
     }
@@ -279,10 +403,45 @@ impl App {
             .or_else(|| self.foreground_id.clone())
     }
 
+    // --------------------------------------------------------- harness switch
+
+    /// Switch harness manually (`Tab`, `/harness`, `/models`).
+    /// When the harness actually changes, clears the current session/timeline,
+    /// queues `CreateSession` for the new harness, and refreshes harness commands.
+    pub fn switch_harness(&mut self, new_harness: &str, new_model: Option<String>) {
+        let changed = self.harness != new_harness;
+        self.harness = new_harness.to_string();
+        self.model = new_model;
+        self.picker_harness = HARNESSES.iter().position(|h| *h == self.harness).unwrap_or(0);
+        if changed {
+            self.current = None;
+            self.current_asd = None;
+            self.timeline.clear();
+            self.timeline_sel = 0;
+            self.timeline_scroll = None;
+            self.resume = None;
+            self.harness_commands.clear();
+            self.push(Action::CreateSession { title: None });
+            self.push(Action::RefreshHarnessCommands);
+            self.set_status(format!(
+                "Switched to {} · new session · model {}",
+                self.harness,
+                self.model.as_deref().unwrap_or("(default)")
+            ));
+        } else {
+            self.set_status(format!(
+                "Harness {} · model {}",
+                self.harness,
+                self.model.as_deref().unwrap_or("(default)")
+            ));
+        }
+    }
+
     // ---------------------------------------------------------------- sessions
 
     pub fn filtered_sessions(&self) -> Vec<usize> {
-        let q = self.search.to_lowercase();
+        let q = self.search.trim().to_lowercase();
+        let tokens: Vec<&str> = q.split_whitespace().collect();
         self.sessions
             .iter()
             .enumerate()
@@ -291,18 +450,20 @@ impl App {
                 None => true,
             })
             .filter(|(_, s)| {
-                q.is_empty()
-                    || [
-                        Some(&s.harness),
-                        Some(&s.harness_session_id),
-                        s.summary.as_ref(),
-                        s.model.as_ref(),
-                        s.asd_session_id.as_ref(),
-                        s.asd_phase.as_ref(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .any(|f| f.to_lowercase().contains(&q))
+                tokens.is_empty()
+                    || tokens.iter().all(|tok| {
+                        [
+                            Some(&s.harness),
+                            Some(&s.harness_session_id),
+                            s.summary.as_ref(),
+                            s.model.as_ref(),
+                            s.asd_session_id.as_ref(),
+                            s.asd_phase.as_ref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .any(|f| f.to_lowercase().contains(tok))
+                    })
             })
             .map(|(i, _)| i)
             .collect()
@@ -335,6 +496,224 @@ impl App {
         v
     }
 
+    // ------------------------------------------------ slash & command palette
+
+    pub fn all_slash_commands(&self) -> Vec<SlashCommandEntry> {
+        let mut out: Vec<SlashCommandEntry> = BUILTIN_COMMANDS
+            .iter()
+            .map(|(name, usage, desc)| SlashCommandEntry {
+                name: (*name).to_string(),
+                usage: (*usage).to_string(),
+                description: (*desc).to_string(),
+                badge: CommandBadge::Nexus,
+                is_builtin: true,
+                kind_label: "builtin",
+            })
+            .collect();
+
+        for hc in &self.harness_commands {
+            let name = hc.name.trim_start_matches('/').to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let kind_label = match hc.kind {
+                HarnessCommandKind::Command => "command",
+                HarnessCommandKind::Skill => "skill",
+                HarnessCommandKind::Workflow => "workflow",
+            };
+            out.push(SlashCommandEntry {
+                usage: format!("/{name}"),
+                name,
+                description: hc.description.clone(),
+                badge: CommandBadge::Harness(hc.harness.clone()),
+                is_builtin: false,
+                kind_label,
+            });
+        }
+        out
+    }
+
+    fn current_slash_query(&self) -> Option<String> {
+        if self.popup_dismissed || self.overlay.is_some() || self.prompt.is_some() || self.confirm.is_some() {
+            return None;
+        }
+        if self.input_area.lines.len() != 1 {
+            return None;
+        }
+        let trimmed = self.input_area.lines[0].trim_start();
+        if !trimmed.starts_with('/') {
+            return None;
+        }
+        let after = &trimmed[1..];
+        if after.contains(char::is_whitespace) {
+            return None;
+        }
+        Some(after.to_lowercase())
+    }
+
+    pub fn is_slash_popup_active(&self) -> bool {
+        self.current_slash_query().is_some() && !self.filtered_slash_commands().is_empty()
+    }
+
+    pub fn filtered_slash_commands(&self) -> Vec<SlashCommandEntry> {
+        let Some(q) = self.current_slash_query() else {
+            return Vec::new();
+        };
+        let all = self.all_slash_commands();
+        if q.is_empty() {
+            // Hide duplicate short alias `/s` and `/quit` when query is empty to keep list tidy.
+            return all.into_iter().filter(|c| c.name != "s" && c.name != "quit").collect();
+        }
+        let mut prefix_matches = Vec::new();
+        let mut substring_matches = Vec::new();
+        for c in all {
+            let name_l = c.name.to_lowercase();
+            let desc_l = c.description.to_lowercase();
+            if name_l.starts_with(&q) {
+                prefix_matches.push(c);
+            } else if name_l.contains(&q) || desc_l.contains(&q) {
+                substring_matches.push(c);
+            }
+        }
+        prefix_matches.extend(substring_matches);
+        prefix_matches
+    }
+
+    pub fn palette_items(&self) -> Vec<SlashCommandEntry> {
+        let mut all = self.all_slash_commands();
+        all.retain(|c| c.name != "s" && c.name != "quit");
+        for h in HARNESSES {
+            all.push(SlashCommandEntry {
+                name: format!("harness {h}"),
+                usage: format!("/harness {h}"),
+                description: format!("Switch active harness to {h} (opens new session)"),
+                badge: CommandBadge::Nexus,
+                is_builtin: true,
+                kind_label: "harness",
+            });
+        }
+        let q = self.palette_query.trim().to_lowercase();
+        if q.is_empty() {
+            return all;
+        }
+        let tokens: Vec<&str> = q.split_whitespace().collect();
+        all.into_iter()
+            .filter(|c| {
+                let hay = format!("{} {} {} {}", c.name, c.usage, c.description, c.badge.label()).to_lowercase();
+                tokens.iter().all(|t| hay.contains(t))
+            })
+            .collect()
+    }
+
+    // -------------------------------------------------------- @file & /cd dir
+
+    pub fn is_file_popup_active(&self) -> bool {
+        self.file_popup_open
+            && self.overlay.is_none()
+            && self.prompt.is_none()
+            && self.confirm.is_none()
+            && self.input_area.active_at_token().is_some()
+            && !self.filtered_files().is_empty()
+    }
+
+    pub fn filtered_files(&self) -> Vec<FsListEntry> {
+        let q = self
+            .input_area
+            .active_at_token()
+            .map(|(_, _, q)| q.to_lowercase())
+            .unwrap_or_default();
+        self.file_candidates
+            .iter()
+            .filter(|e| q.is_empty() || e.path.to_lowercase().contains(&q) || e.name.to_lowercase().contains(&q))
+            .cloned()
+            .collect()
+    }
+
+    /// Combined directory list for `/cd` modal: known `projects` + `dir_candidates` (`fs_list(Dirs)`).
+    pub fn dir_picker_items(&self) -> Vec<(String, String)> {
+        let q = self.dir_query.trim().to_lowercase();
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for p in &self.projects {
+            if q.is_empty() || p.project_root.to_lowercase().contains(&q) {
+                if seen.insert(p.project_root.clone()) {
+                    let count = p.session_count.map(|c| format!("{c} sessions")).unwrap_or_else(|| "project".into());
+                    out.push((p.project_root.clone(), format!("[project] {count}")));
+                }
+            }
+        }
+        for d in &self.dir_candidates {
+            if q.is_empty() || d.path.to_lowercase().contains(&q) || d.name.to_lowercase().contains(&q) {
+                let full = self.resolve_dir_path(&d.path);
+                if seen.insert(full.clone()) {
+                    out.push((full, format!("[dir] {}", d.path)));
+                }
+            }
+        }
+        out
+    }
+
+    pub fn resolve_dir_path(&self, raw: &str) -> String {
+        let trimmed = raw.trim();
+        let p = Path::new(trimmed);
+        if p.is_absolute() || trimmed.contains(":/") || trimmed.contains(":\\") || trimmed.starts_with('/') {
+            trimmed.replace('\\', "/")
+        } else {
+            let base = self.project_root.trim_end_matches(['/', '\\']);
+            format!("{base}/{}", trimmed.trim_start_matches(['/', '\\'])).replace('\\', "/")
+        }
+    }
+
+    // ------------------------------------------------------------- local shell
+
+    /// Execute a `!shell` command in `project_root` and append an [`EntryKind::Shell`] card to the timeline.
+    pub fn execute_shell(&mut self, cmd: &str) {
+        let mut command = if cfg!(windows) {
+            let mut c = ProcessCommand::new("cmd");
+            c.args(["/C", cmd]);
+            c
+        } else {
+            let mut c = ProcessCommand::new("sh");
+            c.args(["-c", cmd]);
+            c
+        };
+        let root_path = Path::new(&self.project_root);
+        if root_path.is_dir() {
+            command.current_dir(root_path);
+        }
+        match command.output() {
+            Ok(out) => {
+                let code = out.status.code().unwrap_or(-1);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let mut combined = String::new();
+                if !stdout.trim_end().is_empty() {
+                    combined.push_str(stdout.trim_end());
+                }
+                if !stderr.trim_end().is_empty() {
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(stderr.trim_end());
+                }
+                if combined.is_empty() {
+                    combined = format!("(no output, exit code {code})");
+                }
+                self.timeline.push(Entry::shell(cmd, combined, code));
+                self.timeline_sel = self.timeline.entries.len().saturating_sub(1);
+                self.timeline_scroll = None;
+                self.set_status(format!("Shell !{cmd} (exit {code})"));
+            }
+            Err(e) => {
+                self.timeline.push(Entry::shell(cmd, format!("shell error: {e}"), -1));
+                self.timeline_sel = self.timeline.entries.len().saturating_sub(1);
+                self.timeline_scroll = None;
+                self.set_status(format!("Shell failed: {e}"));
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- streaming
 
     /// Drain pending SSE messages into the timeline.
@@ -361,6 +740,10 @@ impl App {
         }
         for m in &msgs {
             self.timeline.apply(m);
+        }
+        if !msgs.is_empty() {
+            self.timeline_sel = self.timeline.entries.len().saturating_sub(1);
+            self.timeline_scroll = None;
         }
         if closed || !self.timeline.streaming {
             self.timeline.end_turn(Some("stream closed"));
@@ -392,7 +775,7 @@ impl App {
 
     // --------------------------------------------------------------- overlays
 
-    fn open_overlay(&mut self, o: Overlay) {
+    pub fn open_overlay(&mut self, o: Overlay) {
         if self.overlay == Some(o) {
             self.overlay = None;
             self.routing_editor = None;
@@ -425,6 +808,18 @@ impl App {
                 if self.models.is_empty() {
                     self.push(Action::RefreshModels { force: false });
                 }
+            }
+            Overlay::Sessions => {
+                self.push(Action::RefreshSessions);
+            }
+            Overlay::DirPicker => {
+                self.dir_query.clear();
+                self.dir_sel = 0;
+                self.push(Action::ListDirs { prefix: None });
+            }
+            Overlay::CommandPalette => {
+                self.palette_query.clear();
+                self.palette_sel = 0;
             }
             Overlay::Help => {}
         }
@@ -465,6 +860,7 @@ impl App {
             ('r', Overlay::Routing),
             ('t', Overlay::Terminal),
             ('k', Overlay::ModelPicker),
+            ('p', Overlay::CommandPalette),
         ];
         for (c, o) in overlay_key {
             if ctrl(&k, c) {
@@ -494,7 +890,25 @@ impl App {
             return;
         }
 
+        // Tab handling:
+        // - In Input focus with active `/` or `@` popup: autocomplete popup item.
+        // - In Input focus without sidebar: cycle 5 harnesses (creating new session).
+        // - When sidebar is open or focus is on Projects/Sessions/Timeline: cycle focus panes.
         if k.code == KeyCode::Tab || k.code == KeyCode::BackTab {
+            if self.focus == Focus::Input && (self.is_slash_popup_active() || self.is_file_popup_active()) {
+                self.handle_input_key(k);
+                return;
+            }
+            if self.focus == Focus::Input && !self.sidebar_open {
+                let i = HARNESSES.iter().position(|h| *h == self.harness).unwrap_or(0);
+                let next = if k.code == KeyCode::Tab {
+                    (i + 1) % HARNESSES.len()
+                } else {
+                    (i + HARNESSES.len() - 1) % HARNESSES.len()
+                };
+                self.switch_harness(HARNESSES[next], None);
+                return;
+            }
             let order = [Focus::Projects, Focus::Sessions, Focus::Timeline, Focus::Input];
             let i = order.iter().position(|f| *f == self.focus).unwrap_or(0);
             let n = if k.code == KeyCode::Tab { i + 1 } else { i + 3 };
@@ -509,6 +923,149 @@ impl App {
             Focus::Input => self.handle_input_key(k),
         }
     }
+
+    // ------------------------------------------------------------- mouse input
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) {
+        if self.confirm.is_some() || self.prompt.is_some() {
+            return;
+        }
+        match m.kind {
+            MouseEventKind::ScrollUp => self.scroll_up(),
+            MouseEventKind::ScrollDown => self.scroll_down(),
+            MouseEventKind::Down(MouseButton::Left) => self.click_at(m.column, m.row),
+            _ => {}
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        if self.is_slash_popup_active() {
+            self.slash_sel = self.slash_sel.saturating_sub(1);
+            return;
+        }
+        if self.is_file_popup_active() {
+            self.file_sel = self.file_sel.saturating_sub(1);
+            return;
+        }
+        if let Some(ov) = self.overlay {
+            match ov {
+                Overlay::CommandPalette => self.palette_sel = self.palette_sel.saturating_sub(1),
+                Overlay::Sessions => self.session_sel = self.session_sel.saturating_sub(1),
+                Overlay::DirPicker => self.dir_sel = self.dir_sel.saturating_sub(1),
+                Overlay::ModelPicker => self.picker_sel = self.picker_sel.saturating_sub(1),
+                Overlay::Board => match self.board_pane {
+                    BoardPane::Tasks => self.board_sel = self.board_sel.saturating_sub(1),
+                    BoardPane::Plan => self.plan_scroll = self.plan_scroll.saturating_sub(2),
+                },
+                Overlay::Diff => self.diff_scroll = self.diff_scroll.saturating_sub(2),
+                Overlay::Routing => self.routing_scroll = self.routing_scroll.saturating_sub(2),
+                Overlay::Subagents => self.sub_sel = self.sub_sel.saturating_sub(1),
+                Overlay::Terminal | Overlay::Help => {}
+            }
+            return;
+        }
+        if !self.timeline.entries.is_empty() {
+            self.timeline_sel = self.timeline_sel.saturating_sub(1);
+            self.timeline_scroll = Some(self.timeline_scroll.unwrap_or(0).saturating_sub(2));
+        }
+    }
+
+    fn scroll_down(&mut self) {
+        if self.is_slash_popup_active() {
+            let max = self.filtered_slash_commands().len().saturating_sub(1);
+            self.slash_sel = (self.slash_sel + 1).min(max);
+            return;
+        }
+        if self.is_file_popup_active() {
+            let max = self.filtered_files().len().saturating_sub(1);
+            self.file_sel = (self.file_sel + 1).min(max);
+            return;
+        }
+        if let Some(ov) = self.overlay {
+            match ov {
+                Overlay::CommandPalette => {
+                    let max = self.palette_items().len().saturating_sub(1);
+                    self.palette_sel = (self.palette_sel + 1).min(max);
+                }
+                Overlay::Sessions => {
+                    let max = self.filtered_sessions().len().saturating_sub(1);
+                    self.session_sel = (self.session_sel + 1).min(max);
+                }
+                Overlay::DirPicker => {
+                    let max = self.dir_picker_items().len().saturating_sub(1);
+                    self.dir_sel = (self.dir_sel + 1).min(max);
+                }
+                Overlay::ModelPicker => {
+                    let max = self.picker_models().len().saturating_sub(1);
+                    self.picker_sel = (self.picker_sel + 1).min(max);
+                }
+                Overlay::Board => match self.board_pane {
+                    BoardPane::Tasks => {
+                        let max = self.board_tasks().len().saturating_sub(1);
+                        self.board_sel = (self.board_sel + 1).min(max);
+                    }
+                    BoardPane::Plan => self.plan_scroll = self.plan_scroll.saturating_add(2),
+                },
+                Overlay::Diff => self.diff_scroll = self.diff_scroll.saturating_add(2),
+                Overlay::Routing => self.routing_scroll = self.routing_scroll.saturating_add(2),
+                Overlay::Subagents => {
+                    let max = self.subagents.len().saturating_sub(1);
+                    self.sub_sel = (self.sub_sel + 1).min(max);
+                }
+                Overlay::Terminal | Overlay::Help => {}
+            }
+            return;
+        }
+        if !self.timeline.entries.is_empty() {
+            let max = self.timeline.entries.len().saturating_sub(1);
+            self.timeline_sel = (self.timeline_sel + 1).min(max);
+            self.timeline_scroll = Some(self.timeline_scroll.unwrap_or(0).saturating_add(2));
+        }
+    }
+
+    fn click_at(&mut self, col: u16, row: u16) {
+        let regions = self.ui_regions.borrow().clone();
+
+        // 1. Check active `/` or `@` popup click
+        if self.is_slash_popup_active() {
+            if let Some((_, idx)) = regions.popup_rows.iter().find(|(y, _)| *y == row) {
+                self.slash_sel = *idx;
+                self.submit_input();
+                return;
+            }
+        }
+        if self.is_file_popup_active() {
+            if let Some((_, idx)) = regions.popup_rows.iter().find(|(y, _)| *y == row) {
+                self.file_sel = *idx;
+                self.complete_file_selection();
+                return;
+            }
+        }
+
+        if self.overlay.is_some() {
+            return;
+        }
+
+        // 2. Check timeline collapsible entry click
+        if let Some((_, _, idx)) = regions
+            .timeline_entries
+            .iter()
+            .find(|(start_y, end_y, _)| row >= *start_y && row < *end_y)
+        {
+            self.timeline_sel = *idx;
+            self.timeline.toggle(*idx);
+            return;
+        }
+
+        // 3. Check input area click
+        if let Some(r) = regions.input_rect {
+            if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
+                self.focus = Focus::Input;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- prompts
 
     fn handle_prompt_key(&mut self, k: KeyEvent) {
         let Some(p) = self.prompt.as_mut() else { return };
@@ -607,6 +1164,15 @@ impl App {
         match k.code {
             KeyCode::Enter => {
                 if let Some(s) = sel {
+                    // OpenSession adjusts harness to the session's harness without creating a new session!
+                    self.harness = s.harness.clone();
+                    if s.model.is_some() {
+                        self.model = s.model.clone();
+                    }
+                    self.picker_harness = HARNESSES.iter().position(|h| *h == self.harness).unwrap_or(0);
+                    if self.overlay == Some(Overlay::Sessions) {
+                        self.overlay = None;
+                    }
                     self.push(Action::OpenSession(Box::new(s)));
                 }
             }
@@ -626,9 +1192,8 @@ impl App {
             }
             KeyCode::Char('H') => {
                 let i = HARNESSES.iter().position(|h| *h == self.harness).unwrap_or(0);
-                self.harness = HARNESSES[(i + 1) % HARNESSES.len()].to_string();
-                self.model = None;
-                self.set_status(format!("Harness: {}", self.harness));
+                let next = HARNESSES[(i + 1) % HARNESSES.len()];
+                self.switch_harness(next, None);
             }
             KeyCode::Char('m') => self.open_overlay(Overlay::ModelPicker),
             _ => {
@@ -687,37 +1252,356 @@ impl App {
     fn handle_timeline_key(&mut self, k: KeyEvent) {
         let n = self.timeline.entries.len();
         if nav(&mut self.timeline_sel, n, k.code) {
+            self.timeline_scroll = None;
             return;
         }
         match k.code {
             KeyCode::Enter | KeyCode::Char(' ') => self.timeline.toggle(self.timeline_sel),
-            KeyCode::Char('i') => self.focus = Focus::Input,
+            KeyCode::Char('i') | KeyCode::Esc => self.focus = Focus::Input,
             _ => {}
         }
     }
 
+    // --------------------------------------------------------- input & popups
+
+    fn sync_input_before_edit(&mut self) {
+        if self.input != self.input_area.text() {
+            self.input_area.set_text(&self.input);
+        }
+    }
+
+    fn sync_input_after_edit(&mut self) {
+        self.input = self.input_area.text();
+
+        // Update `/` slash popup state
+        if self.input_area.lines.len() == 1 && self.input_area.lines[0].trim_start().starts_with('/') {
+            if self.input_area.lines[0].trim() == "/" {
+                self.popup_dismissed = false;
+            }
+            let max = self.filtered_slash_commands().len().saturating_sub(1);
+            self.slash_sel = self.slash_sel.min(max);
+        } else {
+            self.popup_dismissed = false;
+            self.slash_sel = 0;
+        }
+
+        // Update `@` file popup state
+        let trimmed = self.input.trim_start();
+        if !trimmed.starts_with('/') && !trimmed.starts_with('!') {
+            if let Some((_, _, query)) = self.input_area.active_at_token() {
+                self.file_popup_open = true;
+                let prefix = (!query.is_empty()).then_some(query);
+                if self.last_file_prefix.as_ref() != Some(&prefix) {
+                    self.last_file_prefix = Some(prefix.clone());
+                    self.push(Action::ListFiles { prefix });
+                }
+                let max = self.filtered_files().len().saturating_sub(1);
+                self.file_sel = self.file_sel.min(max);
+            } else {
+                self.file_popup_open = false;
+                self.last_file_prefix = None;
+                self.file_sel = 0;
+            }
+        } else {
+            self.file_popup_open = false;
+            self.last_file_prefix = None;
+            self.file_sel = 0;
+        }
+    }
+
+    fn complete_slash_selection(&mut self) {
+        let cmds = self.filtered_slash_commands();
+        if let Some(cmd) = cmds.get(self.slash_sel) {
+            let new_text = if matches!(cmd.name.as_str(), "cd" | "harness" | "new") || !cmd.is_builtin {
+                format!("/{} ", cmd.name)
+            } else {
+                format!("/{}", cmd.name)
+            };
+            self.input_area.set_text(&new_text);
+            self.sync_input_after_edit();
+        }
+    }
+
+    fn complete_file_selection(&mut self) -> bool {
+        let files = self.filtered_files();
+        let Some(entry) = files.get(self.file_sel).cloned() else {
+            return false;
+        };
+        let Some((start_col, end_col, _)) = self.input_area.active_at_token() else {
+            return false;
+        };
+        let replacement = format!("@{} ", entry.path);
+        self.input_area.replace_current_line_span(start_col, end_col, &replacement);
+        self.input = self.input_area.text();
+        self.file_popup_open = false;
+        self.file_sel = 0;
+        true
+    }
+
     fn handle_input_key(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Enter => {
-                let text = self.input.trim().to_string();
-                if text.is_empty() {
+        self.sync_input_before_edit();
+
+        // Multiline newline: Shift+Enter, Alt+Enter, or Ctrl+J
+        if (k.code == KeyCode::Enter
+            && (k.modifiers.contains(KeyModifiers::SHIFT) || k.modifiers.contains(KeyModifiers::ALT)))
+            || ctrl(&k, 'j')
+        {
+            self.input_area.newline();
+            self.sync_input_after_edit();
+            return;
+        }
+
+        // `/` slash popup navigation / completion
+        if self.is_slash_popup_active() {
+            match k.code {
+                KeyCode::Up => {
+                    self.slash_sel = self.slash_sel.saturating_sub(1);
                     return;
                 }
+                KeyCode::Down => {
+                    let max = self.filtered_slash_commands().len().saturating_sub(1);
+                    self.slash_sel = (self.slash_sel + 1).min(max);
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.complete_slash_selection();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.popup_dismissed = true;
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.submit_input();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // `@` file popup navigation / completion
+        if self.is_file_popup_active() {
+            match k.code {
+                KeyCode::Up => {
+                    self.file_sel = self.file_sel.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    let max = self.filtered_files().len().saturating_sub(1);
+                    self.file_sel = (self.file_sel + 1).min(max);
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    if self.complete_file_selection() {
+                        return;
+                    }
+                }
+                KeyCode::Esc => {
+                    self.file_popup_open = false;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match k.code {
+            KeyCode::Enter => self.submit_input(),
+            KeyCode::Backspace => {
+                self.input_area.backspace();
+                self.sync_input_after_edit();
+            }
+            KeyCode::Delete => {
+                self.input_area.delete();
+                self.sync_input_after_edit();
+            }
+            KeyCode::Left => {
+                self.input_area.left();
+                self.sync_input_after_edit();
+            }
+            KeyCode::Right => {
+                self.input_area.right();
+                self.sync_input_after_edit();
+            }
+            KeyCode::Up => {
+                self.input_area.up();
+                self.sync_input_after_edit();
+            }
+            KeyCode::Down => {
+                self.input_area.down();
+                self.sync_input_after_edit();
+            }
+            KeyCode::Home => {
+                self.input_area.home();
+                self.sync_input_after_edit();
+            }
+            KeyCode::End => {
+                self.input_area.end();
+                self.sync_input_after_edit();
+            }
+            KeyCode::Esc => self.focus = Focus::Timeline,
+            KeyCode::Char(c) => {
+                self.input_area.insert(c);
+                self.sync_input_after_edit();
+            }
+            _ => {}
+        }
+    }
+
+    fn clear_input(&mut self) {
+        self.input_area.clear();
+        self.input.clear();
+        self.popup_dismissed = false;
+        self.slash_sel = 0;
+        self.file_popup_open = false;
+        self.file_sel = 0;
+        self.last_file_prefix = None;
+    }
+
+    fn submit_input(&mut self) {
+        self.sync_input_before_edit();
+        let text = self.input.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+
+        // 1. Slash command (`/cmd ...`)
+        if text.starts_with('/') && !text.contains('\n') {
+            let selected = if self.is_slash_popup_active() {
+                self.filtered_slash_commands().get(self.slash_sel).cloned()
+            } else {
+                None
+            };
+            self.clear_input();
+            self.execute_slash_command(&text, selected);
+            return;
+        }
+
+        // 2. Shell command (`!cmd ...`)
+        if let Some(rest) = text.strip_prefix('!') {
+            let cmd = rest.trim().to_string();
+            self.clear_input();
+            if !cmd.is_empty() {
+                self.push(Action::RunShell(cmd));
+            }
+            return;
+        }
+
+        // 3. Normal chat prompt
+        if self.is_streaming() {
+            self.set_status("A turn is already streaming (Ctrl+X to cancel)");
+            return;
+        }
+        self.clear_input();
+        self.push(Action::SendPrompt(text));
+    }
+
+    pub fn execute_slash_command(&mut self, raw: &str, popup_selected: Option<SlashCommandEntry>) {
+        let stripped = raw.trim().trim_start_matches('/');
+        let mut parts = stripped.splitn(2, char::is_whitespace);
+        let typed_cmd = parts.next().unwrap_or("").to_lowercase();
+        let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
+
+        // If no args were typed and a popup item was highlighted, use the highlighted popup item.
+        let resolved_cmd = if arg.is_none() {
+            if let Some(sel) = &popup_selected {
+                sel.name.clone()
+            } else {
+                typed_cmd.clone()
+            }
+        } else {
+            typed_cmd.clone()
+        };
+
+        // Handle `/harness <name>` entries from CommandPalette (`"harness codex"`)
+        if let Some(h_arg) = resolved_cmd.strip_prefix("harness ") {
+            let h_arg = h_arg.trim();
+            if HARNESSES.contains(&h_arg) {
+                self.switch_harness(h_arg, None);
+                return;
+            }
+        }
+
+        match resolved_cmd.as_str() {
+            "cd" => {
+                if let Some(path_arg) = arg {
+                    let target = self.resolve_dir_path(path_arg);
+                    self.push(Action::SelectProject(target));
+                } else {
+                    self.open_overlay(Overlay::DirPicker);
+                }
+            }
+            "sessions" | "s" => {
+                self.open_overlay(Overlay::Sessions);
+            }
+            "new" => {
+                self.current = None;
+                self.current_asd = None;
+                self.timeline.clear();
+                self.timeline_sel = 0;
+                self.timeline_scroll = None;
+                self.push(Action::CreateSession { title: arg.map(str::to_string) });
+            }
+            "models" => {
+                self.open_overlay(Overlay::ModelPicker);
+            }
+            "harness" => {
+                if let Some(name) = arg {
+                    if let Some(&h) = HARNESSES.iter().find(|&&h| h.eq_ignore_ascii_case(name)) {
+                        self.switch_harness(h, None);
+                    } else {
+                        self.set_status(format!("Unknown harness '{name}'. Valid: {}", HARNESSES.join(", ")));
+                    }
+                } else {
+                    let i = HARNESSES.iter().position(|h| *h == self.harness).unwrap_or(0);
+                    let next = HARNESSES[(i + 1) % HARNESSES.len()];
+                    self.switch_harness(next, None);
+                }
+            }
+            "board" => self.open_overlay(Overlay::Board),
+            "diff" => self.open_overlay(Overlay::Diff),
+            "subagents" => self.open_overlay(Overlay::Subagents),
+            "routing" => self.open_overlay(Overlay::Routing),
+            "terminal" => self.open_overlay(Overlay::Terminal),
+            "theme" => {
+                self.toggle_theme();
+            }
+            "sidebar" => {
+                self.sidebar_open = !self.sidebar_open;
+                if !self.sidebar_open && matches!(self.focus, Focus::Projects | Focus::Sessions) {
+                    self.focus = Focus::Input;
+                }
+                self.set_status(format!("Sidebar {}", if self.sidebar_open { "shown" } else { "hidden" }));
+            }
+            "clear" => {
+                self.timeline.clear();
+                self.timeline_sel = 0;
+                self.timeline_scroll = None;
+                self.set_status("Timeline cleared");
+            }
+            "help" => self.open_overlay(Overlay::Help),
+            "exit" | "quit" => {
+                if self.is_streaming() {
+                    self.push(Action::CancelTurn);
+                }
+                self.should_quit = true;
+            }
+            _ => {
+                // Harness-specific `/command` or custom slash prompt → forward to turn stream!
                 if self.is_streaming() {
                     self.set_status("A turn is already streaming (Ctrl+X to cancel)");
                     return;
                 }
-                self.input.clear();
-                self.push(Action::SendPrompt(text));
+                let prompt = if let Some(a) = arg {
+                    format!("/{resolved_cmd} {a}")
+                } else {
+                    format!("/{resolved_cmd}")
+                };
+                self.push(Action::SendPrompt(prompt));
             }
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Esc => self.focus = Focus::Timeline,
-            KeyCode::Char(c) => self.input.push(c),
-            _ => {}
         }
     }
+
+    // --------------------------------------------------------- overlay keys
 
     fn handle_overlay_key(&mut self, o: Overlay, k: KeyEvent) {
         if o == Overlay::Routing && self.routing_editor.is_some() {
@@ -731,6 +1615,9 @@ impl App {
         match o {
             Overlay::Help => {}
             Overlay::ModelPicker => self.handle_picker_key(k),
+            Overlay::Sessions => self.handle_sessions_key(k),
+            Overlay::DirPicker => self.handle_dir_picker_key(k),
+            Overlay::CommandPalette => self.handle_palette_key(k),
             Overlay::Board => self.handle_board_key(k),
             Overlay::Subagents => self.handle_subagents_key(k),
             Overlay::Diff => self.handle_diff_key(k),
@@ -763,14 +1650,73 @@ impl App {
             }
             KeyCode::Enter => {
                 let models = self.picker_models();
-                self.harness = HARNESSES[self.picker_harness].to_string();
-                self.model = models.get(self.picker_sel).filter(|_| self.picker_sel > 0).cloned();
+                let new_harness = HARNESSES[self.picker_harness].to_string();
+                let new_model = models.get(self.picker_sel).filter(|_| self.picker_sel > 0).cloned();
                 self.overlay = None;
-                self.set_status(format!(
-                    "Harness {} · model {}",
-                    self.harness,
-                    self.model.as_deref().unwrap_or("(default)")
-                ));
+                self.switch_harness(&new_harness, new_model);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_dir_picker_key(&mut self, k: KeyEvent) {
+        let items = self.dir_picker_items();
+        let n = items.len();
+        match k.code {
+            KeyCode::Up => self.dir_sel = self.dir_sel.saturating_sub(1),
+            KeyCode::Down => self.dir_sel = (self.dir_sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Tab => {
+                if let Some((path, _)) = items.get(self.dir_sel) {
+                    self.dir_query = format!("{}/", path.trim_end_matches('/'));
+                    self.dir_sel = 0;
+                    self.push(Action::ListDirs { prefix: Some(self.dir_query.clone()) });
+                }
+            }
+            KeyCode::Backspace => {
+                self.dir_query.pop();
+                self.dir_sel = 0;
+                let prefix = (!self.dir_query.is_empty()).then(|| self.dir_query.clone());
+                self.push(Action::ListDirs { prefix });
+            }
+            KeyCode::Char(c) => {
+                self.dir_query.push(c);
+                self.dir_sel = 0;
+                self.push(Action::ListDirs { prefix: Some(self.dir_query.clone()) });
+            }
+            KeyCode::Enter => {
+                let target = items
+                    .get(self.dir_sel)
+                    .map(|(p, _)| p.clone())
+                    .or_else(|| (!self.dir_query.trim().is_empty()).then(|| self.resolve_dir_path(&self.dir_query)));
+                self.overlay = None;
+                if let Some(root) = target {
+                    self.push(Action::SelectProject(root));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_palette_key(&mut self, k: KeyEvent) {
+        let items = self.palette_items();
+        let n = items.len();
+        match k.code {
+            KeyCode::Up => self.palette_sel = self.palette_sel.saturating_sub(1),
+            KeyCode::Down => self.palette_sel = (self.palette_sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Backspace => {
+                self.palette_query.pop();
+                self.palette_sel = 0;
+            }
+            KeyCode::Char(c) => {
+                self.palette_query.push(c);
+                self.palette_sel = 0;
+            }
+            KeyCode::Enter => {
+                self.overlay = None;
+                if let Some(item) = items.get(self.palette_sel).cloned() {
+                    let cmd = format!("/{}", item.name);
+                    self.execute_slash_command(&cmd, Some(item));
+                }
             }
             _ => {}
         }

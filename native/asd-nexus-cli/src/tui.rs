@@ -1,11 +1,12 @@
-//! Terminal lifecycle (raw mode + alternate screen with Drop/panic cleanup) and event loop.
+//! Terminal lifecycle (raw mode + alternate screen + mouse capture with Drop/panic cleanup)
+//! and event loop.
 
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use asd_nexus_client::NexusClient;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
@@ -17,7 +18,7 @@ use crate::{exec, ui};
 
 fn restore() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen, cursor::Show);
 }
 
 /// Restores the terminal on Drop (normal exit, `?` error, or unwinding panic).
@@ -34,7 +35,7 @@ impl TerminalGuard {
         }));
         enable_raw_mode()?;
         let mut out = io::stdout();
-        if let Err(e) = execute!(out, EnterAlternateScreen) {
+        if let Err(e) = execute!(out, EnterAlternateScreen, EnableMouseCapture) {
             restore();
             return Err(e.into());
         }
@@ -65,10 +66,10 @@ pub fn run_tui(cli: &Cli, client: &NexusClient) -> Result<()> {
             break;
         }
         if event::poll(Duration::from_millis(80))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    app.handle_key(k);
-                }
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => app.handle_key(k),
+                Event::Mouse(m) => app.handle_mouse(m),
+                _ => {}
             }
         }
     }

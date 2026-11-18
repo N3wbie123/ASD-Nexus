@@ -2,9 +2,8 @@
 
 use asd_nexus_client::*;
 
-use crate::app::{phase_name, terminal_name, Action, ActiveStream, App, TERMINALS};
-use crate::timeline::Entry;
-use crate::timeline::EntryKind;
+use crate::app::{phase_name, terminal_name, Action, ActiveStream, App, HARNESSES, TERMINALS};
+use crate::timeline::{Entry, EntryKind};
 
 fn outcome(app: &mut App, label: &str, success: bool, error: Option<String>) -> bool {
     if success {
@@ -51,7 +50,8 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
             execute(app, client, Action::RefreshProjects);
             execute(app, client, Action::RefreshSessions);
             execute(app, client, Action::RefreshModels { force: false });
-            app.set_status("Connected. F1 = help");
+            execute(app, client, Action::RefreshHarnessCommands);
+            app.set_status("Connected · / commands · @ files · ! shell · Ctrl+P palette");
         }
         Action::RefreshProjects => {
             let req = ListProjectsRequest { skip_disk_check: Some(true), force_refresh: None };
@@ -72,9 +72,15 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
                     app.current = None;
                     app.current_asd = None;
                     app.timeline.clear();
+                    app.timeline_sel = 0;
+                    app.timeline_scroll = None;
                     app.board = None;
                     app.session_sel = 0;
+                    app.file_candidates.clear();
+                    app.dir_candidates.clear();
+                    execute(app, client, Action::RefreshProjects);
                     execute(app, client, Action::RefreshSessions);
+                    execute(app, client, Action::RefreshHarnessCommands);
                 }
             }
         }
@@ -87,6 +93,7 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
             }
         }
         Action::OpenSession(s) => {
+            let harness_changed = app.harness != s.harness;
             let req = GetTranscriptRequest {
                 harness: s.harness.clone(),
                 harness_session_id: s.harness_session_id.clone(),
@@ -96,12 +103,14 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
                 before: None,
             };
             app.harness = s.harness.clone();
+            app.picker_harness = HARNESSES.iter().position(|h| *h == app.harness).unwrap_or(0);
             if s.model.is_some() {
                 app.model = s.model.clone();
             }
             app.current_asd = s.asd_session_id.clone();
             app.current = Some(*s);
             app.timeline_sel = 0;
+            app.timeline_scroll = None;
             if let Some(r) = try_(app, "transcript", client.transcript(&req)) {
                 app.timeline.load_transcript(&r.messages);
                 if let Some(e) = r.error {
@@ -109,6 +118,9 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
                 }
                 app.timeline_sel = app.timeline.entries.len().saturating_sub(1);
                 app.set_status(format!("Loaded {} messages", r.messages.len()));
+            }
+            if harness_changed {
+                execute(app, client, Action::RefreshHarnessCommands);
             }
         }
         Action::CreateSession { title } => {
@@ -125,6 +137,8 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
                     app.current_asd = Some(r.session_id.clone());
                     app.current = None;
                     app.timeline.clear();
+                    app.timeline_sel = 0;
+                    app.timeline_scroll = None;
                     execute(app, client, Action::RefreshSessions);
                     app.set_status(format!("Created session {}", r.session_id));
                 }
@@ -221,6 +235,44 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
                 }
             }
         }
+        Action::RefreshHarnessCommands => {
+            let req = GetHarnessCommandsRequest {
+                harness: Some(app.harness.clone()),
+                project_root: root(app),
+            };
+            if let Some(r) = try_(app, "harness commands", client.harness_commands(&req)) {
+                app.harness_commands = r.commands;
+            }
+        }
+        Action::ListFiles { prefix } => {
+            let req = FsListRequest {
+                project_root: root(app),
+                mode: Some(FsListMode::Files),
+                prefix,
+                limit: Some(100),
+            };
+            if let Some(r) = try_(app, "fs files", client.fs_list(&req)) {
+                app.file_candidates = r.entries;
+                let max = app.filtered_files().len().saturating_sub(1);
+                app.file_sel = app.file_sel.min(max);
+            }
+        }
+        Action::ListDirs { prefix } => {
+            let req = FsListRequest {
+                project_root: root(app),
+                mode: Some(FsListMode::Dirs),
+                prefix,
+                limit: Some(100),
+            };
+            if let Some(r) = try_(app, "fs dirs", client.fs_list(&req)) {
+                app.dir_candidates = r.entries;
+                let max = app.dir_picker_items().len().saturating_sub(1);
+                app.dir_sel = app.dir_sel.min(max);
+            }
+        }
+        Action::RunShell(cmd) => {
+            app.execute_shell(&cmd);
+        }
         Action::SendPrompt(prompt) => {
             let req = TurnStreamRequest {
                 project_root: root(app),
@@ -232,6 +284,8 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
                 streaming: Some(true),
             };
             app.timeline.begin_turn(&prompt);
+            app.timeline_sel = app.timeline.entries.len().saturating_sub(1);
+            app.timeline_scroll = None;
             match client.stream_turn(&req) {
                 Ok((handle, rx)) => {
                     app.stream = Some(ActiveStream { handle: Some(handle), rx });

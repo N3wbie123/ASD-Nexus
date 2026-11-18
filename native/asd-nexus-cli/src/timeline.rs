@@ -1,5 +1,5 @@
-//! 4-category chat timeline (thinking / tool_use / tool_result / text,
-//! plus user / error / system) and the SSE event reducer.
+//! Chat timeline (thinking / tool_use / tool_result / text / shell / user / error / system)
+//! and the SSE event reducer.
 
 use asd_nexus_client::{
     NormalizedTranscriptMessage, OrchestratorEventKind, OrchestratorTurnStatus, StreamMessage,
@@ -13,20 +13,21 @@ pub enum EntryKind {
     ToolUse,
     ToolResult,
     Text,
+    Shell,
     Error,
     System,
 }
 
 impl EntryKind {
     pub fn collapsible(self) -> bool {
-        matches!(self, EntryKind::Thinking | EntryKind::ToolUse | EntryKind::ToolResult)
+        matches!(self, EntryKind::Thinking | EntryKind::ToolUse | EntryKind::ToolResult | EntryKind::Shell)
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub kind: EntryKind,
-    /// Tool name for tool_use / tool_result.
+    /// Tool name for tool_use / tool_result, or command for shell.
     pub title: String,
     pub body: String,
     pub collapsed: bool,
@@ -40,14 +41,27 @@ impl Entry {
             kind,
             title: String::new(),
             body: body.into(),
-            collapsed: kind.collapsible(),
+            collapsed: matches!(kind, EntryKind::Thinking | EntryKind::ToolUse | EntryKind::ToolResult),
             is_error: kind == EntryKind::Error,
             tool_id: None,
         }
     }
+
     pub fn titled(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
         self
+    }
+
+    pub fn shell(cmd: impl Into<String>, output: impl Into<String>, exit_code: i32) -> Self {
+        let cmd = cmd.into();
+        Self {
+            kind: EntryKind::Shell,
+            title: format!("!{cmd} [exit {exit_code}]"),
+            body: output.into(),
+            collapsed: false,
+            is_error: exit_code != 0,
+            tool_id: None,
+        }
     }
 }
 

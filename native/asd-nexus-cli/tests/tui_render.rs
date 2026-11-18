@@ -1,11 +1,11 @@
 use std::sync::mpsc;
 
 use asd_nexus_cli::app::{Action, App, BoardPane, Focus, Overlay, PromptPurpose};
-use asd_nexus_cli::theme;
-use asd_nexus_cli::timeline::EntryKind;
+use asd_nexus_cli::theme::{self, ThemeMode};
+use asd_nexus_cli::timeline::{Entry, EntryKind};
 use asd_nexus_cli::ui;
 use asd_nexus_client::*;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::Terminal;
@@ -18,6 +18,17 @@ fn ch(c: char) -> KeyEvent {
 }
 fn ctrl(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+fn shift_enter() -> KeyEvent {
+    KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+}
+fn alt_enter() -> KeyEvent {
+    KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+}
+fn type_str(app: &mut App, s: &str) {
+    for c in s.chars() {
+        app.handle_key(ch(c));
+    }
 }
 
 fn render(app: &App) -> Buffer {
@@ -40,6 +51,14 @@ fn assert_monochrome(buf: &Buffer) {
         assert!(theme::is_grayscale(c.fg), "cell {i} fg {:?} ({:?})", c.fg, c.symbol());
         assert!(theme::is_grayscale(c.bg), "cell {i} bg {:?} ({:?})", c.bg, c.symbol());
     }
+}
+
+fn assert_has_color(buf: &Buffer) {
+    let colored = buf
+        .content()
+        .iter()
+        .any(|c| !theme::is_grayscale(c.fg) || !theme::is_grayscale(c.bg));
+    assert!(colored, "expected DarkColor buffer to contain chromatic cells");
 }
 
 fn session(h: &str, id: &str, asd: Option<&str>, phase: Option<&str>) -> DiscoveredSessionItem {
@@ -89,24 +108,312 @@ fn app() -> App {
             summary: None,
         }],
     });
+    a.harness_commands = vec![
+        HarnessCommandItem {
+            name: "compact".into(),
+            description: "Compact conversation history".into(),
+            harness: "claude-code".into(),
+            source: HarnessCommandSource::Builtin,
+            kind: HarnessCommandKind::Command,
+            path: None,
+        },
+        HarnessCommandItem {
+            name: "asd-plan".into(),
+            description: "Plan-only ASD workflow".into(),
+            harness: "claude-code".into(),
+            source: HarnessCommandSource::Global,
+            kind: HarnessCommandKind::Skill,
+            path: Some("~/.claude/skills/asd-plan/SKILL.md".into()),
+        },
+    ];
     a
 }
 
 #[test]
-fn base_screen_renders_monochrome() {
-    let a = app();
-    let buf = render(&a);
-    let s = text(&buf);
-    assert!(s.contains("ASD-NEXUS"));
-    assert!(s.contains("PROJECTS"));
-    assert!(s.contains("SESSIONS"));
-    assert!(s.contains("TIMELINE"));
-    assert!(s.contains("TOKENS"));
-    assert_monochrome(&buf);
+fn home_vs_active_chat_screen_and_optional_sidebar() {
+    let mut a = app();
+    assert!(a.is_home());
+    assert!(!a.sidebar_open);
+    assert_eq!(a.focus, Focus::Input);
+
+    // Home screen: no fixed left PROJECTS / SESSIONS box, shows centered hero + tips + input card
+    let home_buf = render(&a);
+    let home_txt = text(&home_buf);
+    assert!(home_txt.contains("ASD-NEXUS"));
+    assert!(home_txt.contains("Autonomous Multi-Harness Workspace"));
+    assert!(home_txt.contains("/sessions"));
+    assert!(home_txt.contains("/models"));
+    assert!(!home_txt.contains("PROJECTS"));
+
+    // Transition to Active chat screen when timeline has entries
+    a.timeline.push(Entry::new(EntryKind::User, "Hello OpenCode UX"));
+    a.timeline.push(Entry::new(EntryKind::Text, "Welcome to the open layout"));
+    assert!(!a.is_home());
+    let chat_buf = render(&a);
+    let chat_txt = text(&chat_buf);
+    assert!(chat_txt.contains("┃ ▶ YOU"));
+    assert!(chat_txt.contains("Hello OpenCode UX"));
+    assert!(chat_txt.contains("┃ ● ASSISTANT"));
+    assert!(chat_txt.contains("Welcome to the open layout"));
+    assert!(!chat_txt.contains("Autonomous Multi-Harness Workspace"));
+    assert!(!chat_txt.contains("PROJECTS"));
+
+    // Optional `/sidebar` toggles left drawer
+    type_str(&mut a, "/sidebar");
+    a.handle_key(key(KeyCode::Enter));
+    assert!(a.sidebar_open);
+    let sb_txt = text(&render(&a));
+    assert!(sb_txt.contains("PROJECTS"));
+    assert!(sb_txt.contains("SESSIONS"));
 }
 
 #[test]
-fn ctrl_overlays_toggle_load_and_render() {
+fn dark_color_default_and_strict_monochrome_theme_toggle() {
+    let mut a = app();
+    assert_eq!(a.theme_mode, ThemeMode::DarkColor);
+    let dark_buf = render(&a);
+    assert_has_color(&dark_buf);
+
+    // Toggle via `/theme` slash command -> Monochrome
+    type_str(&mut a, "/theme");
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.theme_mode, ThemeMode::Monochrome);
+    assert_monochrome(&render(&a));
+
+    // Also verify Active chat screen + overlays in Monochrome pass strict grayscale check
+    a.timeline.push(Entry::new(EntryKind::User, "prompt"));
+    a.timeline.push(Entry::new(EntryKind::Thinking, "thinking details"));
+    a.timeline.push(Entry::shell("git status", "On branch main", 0));
+    assert_monochrome(&render(&a));
+
+    // Toggle back to DarkColor
+    type_str(&mut a, "/theme");
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.theme_mode, ThemeMode::DarkColor);
+    assert_has_color(&render(&a));
+}
+
+#[test]
+fn slash_popup_nexus_and_harness_commands_and_ctrl_p_palette() {
+    let mut a = app();
+    // Typing `/` opens the real-time slash popup above input
+    a.handle_key(ch('/'));
+    assert!(a.is_slash_popup_active());
+    let popup_buf = render(&a);
+    let popup_txt = text(&popup_buf);
+    assert!(popup_txt.contains("SLASH COMMANDS"));
+    assert!(popup_txt.contains("[nexus]"));
+
+    // Filter for harness-specific command `/compact`
+    type_str(&mut a, "comp");
+    assert!(a.is_slash_popup_active());
+    let cmds = a.filtered_slash_commands();
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(cmds[0].name, "compact");
+    assert!(!cmds[0].is_builtin);
+    let filt_txt = text(&render(&a));
+    assert!(filt_txt.contains("/compact"));
+    assert!(filt_txt.contains("[claude-code]"));
+
+    // Pressing Enter on a harness-specific `/command` sends `/compact` to turn stream
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.take_actions(), vec![Action::SendPrompt("/compact".into())]);
+    assert!(a.input.is_empty());
+
+    // Ctrl+P opens Command Palette with both Nexus and harness commands
+    a.handle_key(ctrl('p'));
+    assert_eq!(a.overlay, Some(Overlay::CommandPalette));
+    let pal_txt = text(&render(&a));
+    assert!(pal_txt.contains("COMMAND PALETTE"));
+    assert!(pal_txt.contains("[nexus]"));
+
+    type_str(&mut a, "asd-plan");
+    let items = a.palette_items();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].name, "asd-plan");
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.overlay, None);
+    assert_eq!(a.take_actions(), vec![Action::SendPrompt("/asd-plan".into())]);
+}
+
+#[test]
+fn cd_slash_command_direct_and_modal() {
+    let mut a = app();
+    // `/cd <path>` switches project directly
+    type_str(&mut a, "/cd D:/other-project");
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.take_actions(), vec![Action::SelectProject("D:/other-project".into())]);
+
+    // `/cd` without args opens DirPicker modal and requests ListDirs
+    type_str(&mut a, "/cd");
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.overlay, Some(Overlay::DirPicker));
+    assert_eq!(a.take_actions(), vec![Action::ListDirs { prefix: None }]);
+
+    a.dir_candidates = vec![FsListEntry {
+        path: "packages/web".into(),
+        name: "web".into(),
+        is_dir: true,
+    }];
+    let modal_txt = text(&render(&a));
+    assert!(modal_txt.contains("SWITCH DIRECTORY"));
+    assert!(modal_txt.contains("packages/web"));
+
+    // Select the second item (`packages/web`) and press Enter
+    a.handle_key(key(KeyCode::Down));
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.overlay, None);
+    assert_eq!(a.take_actions(), vec![Action::SelectProject("C:/repo/packages/web".into())]);
+}
+
+#[test]
+fn at_file_autocomplete_and_bang_shell_execution() {
+    let mut a = app();
+    a.file_candidates = vec![
+        FsListEntry { path: "src/main.rs".into(), name: "main.rs".into(), is_dir: false },
+        FsListEntry { path: "src/app.rs".into(), name: "app.rs".into(), is_dir: false },
+    ];
+
+    // Typing `@ap` triggers `ListFiles` and opens the `@FILE AUTOCOMPLETE` popup
+    type_str(&mut a, "review @ap");
+    assert!(a.is_file_popup_active());
+    let actions = a.take_actions();
+    assert!(actions.contains(&Action::ListFiles { prefix: Some("ap".into()) }));
+    let pop_txt = text(&render(&a));
+    assert!(pop_txt.contains("@FILE AUTOCOMPLETE"));
+    assert!(pop_txt.contains("@src/app.rs"));
+
+    // Tab inserts `@src/app.rs ` into input at the token position
+    a.handle_key(key(KeyCode::Tab));
+    assert!(!a.is_file_popup_active());
+    assert_eq!(a.input, "review @src/app.rs ");
+
+    // Clear input and run `!echo hello_nexus` shell command
+    type_str(&mut a, "");
+    a.input.clear();
+    a.input_area.clear();
+    type_str(&mut a, "!echo hello_nexus");
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.take_actions(), vec![Action::RunShell("echo hello_nexus".into())]);
+
+    // Execute local shell and verify timeline records Shell output + exit code
+    a.execute_shell("echo hello_nexus");
+    assert_eq!(a.timeline.entries.len(), 1);
+    assert_eq!(a.timeline.entries[0].kind, EntryKind::Shell);
+    assert!(a.timeline.entries[0].title.contains("!echo hello_nexus [exit 0]"));
+    assert!(a.timeline.entries[0].body.contains("hello_nexus"));
+    let sh_txt = text(&render(&a));
+    assert!(sh_txt.contains("$ SHELL [-] !echo hello_nexus [exit 0]"));
+    assert!(sh_txt.contains("hello_nexus"));
+}
+
+#[test]
+fn multiline_textarea_and_mouse_scroll_and_click() {
+    let mut a = app();
+    type_str(&mut a, "line one");
+    a.handle_key(shift_enter());
+    type_str(&mut a, "line two");
+    a.handle_key(alt_enter());
+    type_str(&mut a, "line three");
+    assert_eq!(a.input_area.lines, vec!["line one", "line two", "line three"]);
+    assert_eq!(a.input, "line one\nline two\nline three");
+
+    // Cursor navigation across lines
+    a.handle_key(key(KeyCode::Up));
+    a.handle_key(key(KeyCode::Home));
+    a.handle_key(ch('>'));
+    assert_eq!(a.input_area.lines[1], ">line two");
+
+    // Submit multiline prompt on Enter
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.take_actions(), vec![Action::SendPrompt("line one\n>line two\nline three".into())]);
+
+    // Mouse wheel scroll & click to fold/unfold collapsible Thinking card
+    a.timeline.push(Entry::new(EntryKind::Thinking, "step 1\nstep 2"));
+    a.timeline.push(Entry::new(EntryKind::Text, "final answer"));
+    assert!(a.timeline.entries[0].collapsed);
+    let _ = render(&a);
+
+    let (start_y, _, _) = a.ui_regions.borrow().timeline_entries[0];
+    a.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 6,
+        row: start_y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(!a.timeline.entries[0].collapsed);
+
+    // Mouse scroll up/down moves timeline selection
+    a.timeline_sel = 1;
+    a.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: 10,
+        row: 10,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(a.timeline_sel, 0);
+
+    // Mouse click on `/` popup item executes the clicked command
+    a.handle_key(ch('/'));
+    let _ = render(&a);
+    let first_popup_row = a.ui_regions.borrow().popup_rows[0].0;
+    a.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 10,
+        row: first_popup_row,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(a.overlay, Some(Overlay::Sessions));
+}
+
+#[test]
+fn harness_switch_creates_new_session_but_open_session_does_not() {
+    let mut a = app();
+    a.current = Some(session("claude-code", "cc-1", Some("asd-1"), Some("running")));
+    a.current_asd = Some("asd-1".into());
+    a.timeline.push(Entry::new(EntryKind::User, "old message"));
+
+    // 1. Pressing Tab in Input focus cycles harness (`claude-code` -> `codex`)
+    //    and clears current session/timeline + queues CreateSession & RefreshHarnessCommands!
+    a.handle_key(key(KeyCode::Tab));
+    assert_eq!(a.harness, "codex");
+    assert!(a.current.is_none());
+    assert!(a.current_asd.is_none());
+    assert!(a.timeline.entries.is_empty());
+    assert_eq!(
+        a.take_actions(),
+        vec![Action::CreateSession { title: None }, Action::RefreshHarnessCommands]
+    );
+
+    // 2. `/harness antigravity` switches harness and queues CreateSession & RefreshHarnessCommands
+    type_str(&mut a, "/harness antigravity");
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.harness, "antigravity");
+    assert_eq!(
+        a.take_actions(),
+        vec![Action::CreateSession { title: None }, Action::RefreshHarnessCommands]
+    );
+
+    // 3. Opening an existing session via `/sessions` (`OpenSession`) switches harness to match
+    //    that session WITHOUT calling `CreateSession`!
+    type_str(&mut a, "/sessions");
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.overlay, Some(Overlay::Sessions));
+    assert_eq!(a.take_actions(), vec![Action::RefreshSessions]);
+
+    // Select `cursor` session (index 2) and press Enter
+    a.handle_key(key(KeyCode::Down));
+    a.handle_key(key(KeyCode::Down));
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.overlay, None);
+    assert_eq!(a.harness, "cursor");
+    let actions = a.take_actions();
+    assert!(matches!(actions.as_slice(), [Action::OpenSession(s)] if s.harness_session_id == "cu-1"));
+    assert!(!actions.iter().any(|act| matches!(act, Action::CreateSession { .. })));
+}
+
+#[test]
+fn ctrl_overlays_toggle_load_and_render_in_both_themes() {
     let cases: [(char, Overlay, &str, Action); 5] = [
         ('b', Overlay::Board, "PROGRESS BOARD", Action::RefreshBoard),
         ('l', Overlay::Subagents, "SUBAGENTS", Action::RefreshSubagents),
@@ -116,6 +423,7 @@ fn ctrl_overlays_toggle_load_and_render() {
     ];
     for (c, ov, title, first) in cases {
         let mut a = app();
+        a.set_theme_mode(ThemeMode::Monochrome);
         a.handle_key(ctrl(c));
         assert_eq!(a.overlay, Some(ov), "ctrl+{c}");
         assert_eq!(a.take_actions().first(), Some(&first), "ctrl+{c}");
@@ -141,14 +449,10 @@ fn board_overlay_actions() {
     a.handle_key(key(KeyCode::Tab));
     assert_eq!(a.board_pane, BoardPane::Plan);
     a.handle_key(ch('b'));
-    for c in "scope".chars() {
-        a.handle_key(ch(c));
-    }
+    type_str(&mut a, "scope");
     a.handle_key(key(KeyCode::Enter));
     assert!(matches!(a.prompt.as_ref().unwrap().purpose, PromptPurpose::DebateProposal { .. }));
-    for c in "use ratatui".chars() {
-        a.handle_key(ch(c));
-    }
+    type_str(&mut a, "use ratatui");
     a.handle_key(key(KeyCode::Enter));
     assert_eq!(a.take_actions(), vec![Action::Debate { topic: "scope".into(), proposal: "use ratatui".into() }]);
 }
@@ -198,9 +502,7 @@ fn subagent_overlay_actions_and_log_tail() {
         }]
     );
     a.handle_key(ch('c'));
-    for c in "go".chars() {
-        a.handle_key(ch(c));
-    }
+    type_str(&mut a, "go");
     a.handle_key(key(KeyCode::Enter));
     assert_eq!(
         a.take_actions(),
@@ -215,6 +517,7 @@ fn subagent_overlay_actions_and_log_tail() {
 #[test]
 fn diff_overlay_approve_reject() {
     let mut a = app();
+    a.set_theme_mode(ThemeMode::Monochrome);
     a.handle_key(ctrl('d'));
     a.take_actions();
     a.handle_key(key(KeyCode::Enter));
@@ -250,7 +553,6 @@ fn routing_editor_saves_valid_json_only() {
     assert!(text(&render(&a)).contains("\"main\""));
     a.handle_key(ch('e'));
     assert!(a.routing_editor.is_some());
-    // Break JSON: insert a stray char at start.
     a.handle_key(ch('x'));
     a.handle_key(ctrl('s'));
     assert!(a.take_actions().is_empty());
@@ -269,6 +571,7 @@ fn routing_editor_saves_valid_json_only() {
 #[test]
 fn terminal_overlay_launch() {
     let mut a = app();
+    a.set_theme_mode(ThemeMode::Monochrome);
     a.handle_key(ctrl('t'));
     a.take_actions();
     a.resume = Some(GetResumeCommandResponse {
@@ -291,11 +594,13 @@ fn terminal_overlay_launch() {
 }
 
 #[test]
-fn session_explorer_keys() {
+fn sessions_modal_keys_and_search() {
     let mut a = app();
-    assert_eq!(a.focus, Focus::Sessions);
+    type_str(&mut a, "/s");
     a.handle_key(key(KeyCode::Enter));
-    assert!(matches!(a.take_actions().as_slice(), [Action::OpenSession(s)] if s.harness_session_id == "cc-1"));
+    assert_eq!(a.overlay, Some(Overlay::Sessions));
+    assert_eq!(a.take_actions(), vec![Action::RefreshSessions]);
+
     a.handle_key(ch('f'));
     a.handle_key(ch('t'));
     a.handle_key(ch('d'));
@@ -317,22 +622,18 @@ fn session_explorer_keys() {
     a.handle_key(ch('!'));
     a.handle_key(key(KeyCode::Enter));
     assert_eq!(a.take_actions(), vec![Action::SaveMemo { session_id: "asd-1".into(), memo: "summary cc-1!".into() }]);
-    // Promote the unpromoted codex session.
+
+    // Promote the unpromoted codex session
     a.handle_key(key(KeyCode::Down));
     a.handle_key(ch('p'));
     assert!(matches!(a.take_actions().as_slice(), [Action::Promote(s)] if s.harness_session_id == "cx-1"));
     a.handle_key(ch('n'));
     a.handle_key(key(KeyCode::Enter));
     assert_eq!(a.take_actions(), vec![Action::CreateSession { title: None }]);
-}
 
-#[test]
-fn session_search_and_harness_filter() {
-    let mut a = app();
+    // Search & harness filter inside `/sessions` modal
     a.handle_key(ch('/'));
-    for c in "cu-".chars() {
-        a.handle_key(ch(c));
-    }
+    type_str(&mut a, "cu-");
     assert_eq!(a.filtered_sessions(), vec![2]);
     a.handle_key(key(KeyCode::Enter));
     assert_eq!(a.search, "cu-");
@@ -346,15 +647,14 @@ fn session_search_and_harness_filter() {
 }
 
 #[test]
-fn model_picker_search_and_select() {
+fn model_picker_search_and_select_triggers_new_session_on_harness_change() {
     let mut a = app();
+    a.set_theme_mode(ThemeMode::Monochrome);
     a.models.insert("codex".into(), vec!["gpt-5".into(), "gpt-5-mini".into(), "o3".into()]);
     a.handle_key(ctrl('k'));
     assert_eq!(a.overlay, Some(Overlay::ModelPicker));
     a.handle_key(key(KeyCode::Tab)); // -> codex
-    for c in "mini".chars() {
-        a.handle_key(ch(c));
-    }
+    type_str(&mut a, "mini");
     assert_eq!(a.picker_models(), vec!["(default)".to_string(), "gpt-5-mini".into()]);
     let buf = render(&a);
     assert!(text(&buf).contains("gpt-5-mini"));
@@ -366,28 +666,21 @@ fn model_picker_search_and_select() {
     assert_eq!(a.harness, "codex");
     assert_eq!(a.model.as_deref(), Some("gpt-5-mini"));
     assert_eq!(a.overlay, None);
-}
-
-#[test]
-fn project_switcher() {
-    let mut a = app();
-    a.handle_key(key(KeyCode::BackTab));
-    assert_eq!(a.focus, Focus::Projects);
-    a.handle_key(key(KeyCode::Enter));
-    assert_eq!(a.take_actions(), vec![Action::SelectProject("C:/repo".into())]);
+    // Because harness changed from claude-code -> codex, CreateSession + RefreshHarnessCommands are queued!
+    assert_eq!(
+        a.take_actions(),
+        vec![Action::CreateSession { title: None }, Action::RefreshHarnessCommands]
+    );
 }
 
 #[test]
 fn streaming_timeline_over_mpsc_and_cancel() {
     let mut a = app();
-    a.focus = Focus::Input;
-    for c in "hello".chars() {
-        a.handle_key(ch(c));
-    }
+    a.set_theme_mode(ThemeMode::Monochrome);
+    type_str(&mut a, "hello");
     a.handle_key(key(KeyCode::Enter));
     assert_eq!(a.take_actions(), vec![Action::SendPrompt("hello".into())]);
 
-    // Simulate exec: begin turn + attach an mpsc receiver fed by an SSE parser.
     a.timeline.begin_turn("hello");
     let (tx, rx) = mpsc::channel();
     a.stream = Some(asd_nexus_cli::app::ActiveStream { handle: None, rx });
@@ -435,6 +728,7 @@ fn streaming_timeline_over_mpsc_and_cancel() {
 #[test]
 fn timeline_collapse_via_keys_and_error_badge() {
     let mut a = app();
+    a.set_theme_mode(ThemeMode::Monochrome);
     a.timeline.apply(&StreamMessage::Event(Box::new(
         serde_json::from_str(r#"{"kind":"thinking","thinking":"secret line one\nline two"}"#).unwrap(),
     )));
@@ -459,6 +753,7 @@ fn timeline_collapse_via_keys_and_error_badge() {
 #[test]
 fn help_and_quit() {
     let mut a = app();
+    a.set_theme_mode(ThemeMode::Monochrome);
     a.handle_key(key(KeyCode::F(1)));
     assert_eq!(a.overlay, Some(Overlay::Help));
     assert_monochrome(&render(&a));

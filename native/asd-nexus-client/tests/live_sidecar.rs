@@ -5,7 +5,8 @@
 //! and ensures clean child termination on Drop.
 
 use asd_nexus_client::{
-    find_server_script, ListProjectsRequest, SidecarConfig, SidecarManager,
+    find_server_script, FsListMode, FsListRequest, GetHarnessCommandsRequest,
+    HarnessCommandSource, ListProjectsRequest, SidecarConfig, SidecarManager,
     SIDECAR_READY_PROTOCOL,
 };
 use std::path::PathBuf;
@@ -59,7 +60,54 @@ fn test_live_sidecar_lifecycle_and_rest_calls() {
         .expect("GET /api/models failed");
     assert!(!models_resp.models.is_empty() || models_resp.models.is_empty());
 
-    // 4. Clean shutdown & drop
+    // 4. Harness commands roundtrip
+    let cmds_resp = client
+        .harness_commands(&GetHarnessCommandsRequest {
+            harness: Some("claude-code".into()),
+            project_root: Some(project_root.to_string_lossy().into_owned()),
+        })
+        .expect("GET /api/harness-commands failed");
+    assert!(
+        cmds_resp
+            .commands
+            .iter()
+            .any(|c| c.name == "compact" && c.source == HarnessCommandSource::Builtin),
+        "Expected builtin /compact command for claude-code"
+    );
+
+    // 5. Workspace fs_list roundtrip (files & dirs)
+    let files_resp = client
+        .fs_list(&FsListRequest {
+            project_root: Some(project_root.to_string_lossy().into_owned()),
+            mode: Some(FsListMode::Files),
+            prefix: Some("protocol.ts".into()),
+            limit: Some(50),
+        })
+        .expect("GET /api/fs/list?mode=files failed");
+    assert_eq!(files_resp.mode, FsListMode::Files);
+    assert!(
+        files_resp
+            .entries
+            .iter()
+            .any(|e| e.path.ends_with("src/shared/protocol.ts") && !e.is_dir),
+        "Expected src/shared/protocol.ts in fs_list files response"
+    );
+
+    let dirs_resp = client
+        .fs_list(&FsListRequest {
+            project_root: Some(project_root.to_string_lossy().into_owned()),
+            mode: Some(FsListMode::Dirs),
+            prefix: None,
+            limit: Some(50),
+        })
+        .expect("GET /api/fs/list?mode=dirs failed");
+    assert_eq!(dirs_resp.mode, FsListMode::Dirs);
+    assert!(
+        dirs_resp.entries.iter().any(|e| e.name == "src" && e.is_dir),
+        "Expected 'src' directory in fs_list dirs response"
+    );
+
+    // 6. Clean shutdown & drop
     let child_pid = ready.pid;
     drop(client);
     sidecar.shutdown().expect("Shutdown failed");

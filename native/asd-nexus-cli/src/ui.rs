@@ -1,23 +1,28 @@
-//! Monochrome ratatui rendering.
+//! OpenCode-inspired borderless TUI layout and modal rendering.
+//! Supports both `ThemeMode::DarkColor` (default) and `ThemeMode::Monochrome` (`/theme`).
 
-use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+};
 use ratatui::Frame;
 
-use crate::app::{terminal_name, App, BoardPane, Focus, Overlay, HARNESSES, TERMINALS};
+use crate::app::{
+    terminal_name, App, BoardPane, CommandBadge, Focus, Overlay, UiRegions, HARNESSES, TERMINALS,
+};
 use crate::theme;
 use crate::timeline::{Entry, EntryKind};
 
-const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+const SPINNER: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
 
 fn block(title: &str, focused: bool) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_type(if focused { BorderType::Thick } else { BorderType::Plain })
+        .border_type(if focused { BorderType::Rounded } else { BorderType::Plain })
         .border_style(theme::border(focused))
         .title(Span::styled(format!(" {title} "), if focused { theme::selected() } else { theme::title() }))
-        .style(theme::base())
+        .style(theme::panel())
 }
 
 /// Wrap text to `width` display columns (char-level, unicode-width aware).
@@ -85,18 +90,38 @@ fn popup(f: &mut Frame, area: Rect, title: &str) -> Rect {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
+    theme::set_mode(app.theme_mode);
+    *app.ui_regions.borrow_mut() = UiRegions::default();
+
     let area = f.area();
     f.render_widget(Block::default().style(theme::base()), area);
+
     let [head, body, foot] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(5), Constraint::Length(2)]).areas(area);
+        Layout::vertical([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)]).areas(area);
     draw_header(f, head, app);
-    let [left, right] = Layout::horizontal([Constraint::Length(38), Constraint::Min(20)]).areas(body);
-    let [proj, sess] = Layout::vertical([Constraint::Percentage(28), Constraint::Min(4)]).areas(left);
-    draw_projects(f, proj, app);
-    draw_sessions(f, sess, app);
-    let [tl, input] = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(right);
-    draw_timeline(f, tl, app);
-    draw_input(f, input, app);
+
+    let main_area = if app.sidebar_open {
+        let [left, right] = Layout::horizontal([Constraint::Length(36), Constraint::Min(24)]).areas(body);
+        let [proj, sess] = Layout::vertical([Constraint::Percentage(30), Constraint::Min(4)]).areas(left);
+        draw_projects(f, proj, app);
+        draw_sessions_panel(f, sess, app);
+        right
+    } else {
+        body
+    };
+
+    if app.is_home() {
+        draw_home(f, main_area, app);
+    } else {
+        let input_lines = app.input_area.lines.len().clamp(1, 6) as u16;
+        let input_h = (input_lines + 3).min(main_area.height.saturating_sub(3)).max(3);
+        let [tl_area, input_area] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(input_h)]).areas(main_area);
+        draw_timeline(f, tl_area, app);
+        draw_input_card(f, input_area, app);
+        draw_input_popups(f, main_area, input_area, app);
+    }
+
     draw_footer(f, foot, app);
 
     if let Some(o) = app.overlay {
@@ -106,29 +131,34 @@ pub fn draw(f: &mut Frame, app: &App) {
             Overlay::Subagents => draw_subagents(f, a, app),
             Overlay::Diff => draw_diff(f, a, app),
             Overlay::Routing => draw_routing(f, a, app),
-            Overlay::Terminal => draw_terminal(f, centered(area, 70, 50), app),
-            Overlay::ModelPicker => draw_picker(f, centered(area, 60, 70), app),
+            Overlay::Terminal => draw_terminal(f, centered(area, 72, 54), app),
+            Overlay::ModelPicker => draw_picker(f, centered(area, 64, 72), app),
+            Overlay::Sessions => draw_sessions_modal(f, centered(area, 82, 78), app),
+            Overlay::DirPicker => draw_dir_picker(f, centered(area, 70, 68), app),
+            Overlay::CommandPalette => draw_command_palette(f, centered(area, 68, 72), app),
             Overlay::Help => draw_help(f, a),
         }
     }
     if let Some(p) = &app.prompt {
-        let a = centered(area, 60, 20);
+        let a = centered(area, 60, 22);
         let inner = popup(f, a, p.purpose.label());
         let t = Paragraph::new(vec![
             Line::styled(format!("{}█", p.buffer), theme::bold()),
             Line::styled("Enter = submit · Esc = cancel", theme::faint()),
         ])
+        .style(theme::panel())
         .wrap(Wrap { trim: false });
         f.render_widget(t, inner);
     }
     if let Some((q, _)) = &app.confirm {
-        let a = centered(area, 50, 20);
+        let a = centered(area, 52, 22);
         let inner = popup(f, a, "CONFIRM");
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(q.clone(), theme::bold()),
                 Line::styled("y = yes · any other key = cancel", theme::faint()),
             ])
+            .style(theme::panel())
             .wrap(Wrap { trim: false }),
             inner,
         );
@@ -136,21 +166,269 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let sess = app.active_session_id().unwrap_or_else(|| "—".into());
+    let sess_summary = app
+        .current
+        .as_ref()
+        .and_then(|s| s.summary.as_deref())
+        .map(|s| first_line(s, 28))
+        .or_else(|| app.active_session_id().map(|id| short(&id, 20)))
+        .unwrap_or_else(|| "new".into());
+
     let state = if app.is_streaming() {
         format!(" {} STREAMING ", SPINNER[(app.timeline.entries.len()) % 4])
     } else {
         " IDLE ".into()
     };
+
+    let t = app.timeline.turn_usage;
+    let s = app.timeline.total_usage;
+    let tok_total = if s.total > 0 { s.total } else { t.input + t.output };
+    let cost_total = if s.cost > 0.0 { s.cost } else { t.cost };
+
     let line = Line::from(vec![
         Span::styled(" ASD-NEXUS ", theme::badge()),
         Span::styled(format!(" {} ", app.project_root), theme::header()),
-        Span::styled(format!("│ {} ", app.harness), theme::header()),
-        Span::styled(format!("│ {} ", app.model.as_deref().unwrap_or("(default)")), theme::header()),
-        Span::styled(format!("│ session {} ", short(&sess, 24)), theme::header()),
+        Span::styled(format!("({}) ", sess_summary), theme::header_muted()),
+        Span::styled(
+            format!("· {} / {} ", app.harness, app.model.as_deref().unwrap_or("(default)")),
+            theme::header(),
+        ),
+        Span::styled(
+            format!("· TOKENS {} (${:.4}) ", fmt_num(tok_total), cost_total),
+            theme::header_muted(),
+        ),
         Span::styled(state, if app.is_streaming() { theme::badge() } else { theme::header() }),
     ]);
     f.render_widget(Paragraph::new(line).style(theme::header()), area);
+}
+
+fn draw_home(f: &mut Frame, area: Rect, app: &App) {
+    let card_w = area.width.saturating_sub(8).clamp(36, 96);
+    let pad_x = area.width.saturating_sub(card_w) / 2;
+    let center_col = Rect::new(area.x + pad_x, area.y, card_w, area.height);
+
+    let input_lines = app.input_area.lines.len().clamp(1, 5) as u16;
+    let input_h = input_lines + 3;
+
+    let [_top_sp, hero_area, card_area, tips_area, _bot_sp] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(6),
+        Constraint::Length(input_h),
+        Constraint::Length(5),
+        Constraint::Min(1),
+    ])
+    .areas(center_col);
+
+    let sess_label = app.active_session_id().unwrap_or_else(|| "none (auto-created on prompt)".into());
+    let hero = vec![
+        Line::from(vec![
+            Span::styled("▄▀█ █▀ █▀▄   ", theme::accent()),
+            Span::styled("█▄░█ █▀▀ ▀▄▀ █░█ █▀", theme::bold()),
+        ]),
+        Line::from(vec![
+            Span::styled("█▀█ ▄█ █▄▀   ", theme::accent()),
+            Span::styled("█░▀█ ██▄ █░█ █▄█ ▄█", theme::bold()),
+        ]),
+        Line::styled("Autonomous Multi-Harness Workspace · OpenCode UX", theme::muted()),
+        Line::from(vec![
+            Span::styled(format!("cwd: {} ", app.project_root), theme::faint()),
+            Span::styled(format!("· session: {} ", short(&sess_label, 24)), theme::faint()),
+            Span::styled(format!("· theme: {}", app.theme_mode.name()), theme::faint()),
+        ]),
+        Line::raw(""),
+    ];
+    f.render_widget(
+        Paragraph::new(hero).alignment(Alignment::Center).style(theme::base()),
+        hero_area,
+    );
+
+    draw_input_card(f, card_area, app);
+
+    let tips = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" /sessions ", theme::surface_accent()),
+            Span::styled(" sessions  ", theme::muted()),
+            Span::styled(" /models ", theme::surface_accent()),
+            Span::styled(" harness & model  ", theme::muted()),
+            Span::styled(" /cd ", theme::surface_accent()),
+            Span::styled(" switch dir  ", theme::muted()),
+            Span::styled(" Ctrl+P ", theme::surface_accent()),
+            Span::styled(" palette", theme::muted()),
+        ]),
+        Line::from(vec![
+            Span::styled(" @file ", theme::surface_accent()),
+            Span::styled(" attach file  ", theme::muted()),
+            Span::styled(" !cmd ", theme::surface_accent()),
+            Span::styled(" run shell  ", theme::muted()),
+            Span::styled(" Tab ", theme::surface_accent()),
+            Span::styled(" cycle harness  ", theme::muted()),
+            Span::styled(" /theme ", theme::surface_accent()),
+            Span::styled(" dark/mono", theme::muted()),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(tips).alignment(Alignment::Center).style(theme::base()),
+        tips_area,
+    );
+
+    draw_input_popups(f, area, card_area, app);
+}
+
+fn draw_input_card(f: &mut Frame, area: Rect, app: &App) {
+    let pad = if area.width > 80 && !app.is_home() { 2 } else { 0 };
+    let card = Rect::new(
+        area.x + pad,
+        area.y,
+        area.width.saturating_sub(pad * 2).max(10),
+        area.height,
+    );
+    app.ui_regions.borrow_mut().input_rect = Some(card);
+
+    f.render_widget(Block::default().style(theme::surface()), card);
+
+    let focused = app.focus == Focus::Input && app.overlay.is_none() && app.prompt.is_none() && app.confirm.is_none();
+    let bar = if focused { "┃ " } else { "│ " };
+    let bar_style = if focused { theme::surface_accent() } else { theme::surface_faint() };
+
+    let text_rows = card.height.saturating_sub(1).max(1) as usize;
+    let total_lines = app.input_area.lines.len();
+    let start_row = app.input_area.row.saturating_sub(text_rows.saturating_sub(1));
+
+    let mut rendered_lines: Vec<Line> = Vec::new();
+    let is_empty = app.input.is_empty() && total_lines == 1 && app.input_area.lines[0].is_empty();
+
+    if is_empty {
+        let placeholder = if app.is_streaming() {
+            "Streaming turn… (Ctrl+X to cancel)"
+        } else {
+            "Ask anything…  (/ commands · @ files · ! shell · Shift+Enter newline)"
+        };
+        let mut spans = vec![Span::styled(bar, bar_style), Span::styled("› ", theme::surface_accent())];
+        if focused {
+            spans.push(Span::styled("█", theme::surface_accent()));
+            spans.push(Span::styled(format!(" {placeholder}"), theme::surface_faint()));
+        } else {
+            spans.push(Span::styled(placeholder, theme::surface_faint()));
+        }
+        rendered_lines.push(Line::from(spans));
+        for _ in 1..text_rows.saturating_sub(1) {
+            rendered_lines.push(Line::from(vec![Span::styled(bar, bar_style)]));
+        }
+    } else {
+        for (r, line_str) in app.input_area.lines.iter().enumerate().skip(start_row).take(text_rows) {
+            let prefix = if r == 0 { "› " } else { "  " };
+            let mut spans = vec![
+                Span::styled(bar, bar_style),
+                Span::styled(prefix, theme::surface_accent()),
+            ];
+            if focused && r == app.input_area.row {
+                let before: String = line_str.chars().take(app.input_area.col).collect();
+                let after: String = line_str.chars().skip(app.input_area.col).collect();
+                spans.push(Span::styled(before, theme::surface()));
+                spans.push(Span::styled("█", theme::surface_accent()));
+                spans.push(Span::styled(after, theme::surface()));
+            } else {
+                spans.push(Span::styled(line_str.clone(), theme::surface()));
+            }
+            rendered_lines.push(Line::from(spans));
+        }
+    }
+
+    // Status pill row at the bottom of the input card
+    let pill = Line::from(vec![
+        Span::styled(bar, bar_style),
+        Span::styled(format!(" {} ", app.harness), theme::harness_badge()),
+        Span::styled(
+            format!(" · {} ", app.model.as_deref().unwrap_or("(default)")),
+            theme::surface_muted(),
+        ),
+        Span::styled(format!("· {} ", short(&app.project_root, 34)), theme::surface_faint()),
+        Span::styled(
+            " · Enter send · Shift+Enter newline · Tab switch harness · / cmd · @ file · ! shell",
+            theme::surface_faint(),
+        ),
+    ]);
+    rendered_lines.push(pill);
+
+    f.render_widget(Paragraph::new(rendered_lines).style(theme::surface()), card);
+}
+
+fn draw_input_popups(f: &mut Frame, container: Rect, input_rect: Rect, app: &App) {
+    if app.is_slash_popup_active() {
+        let cmds = app.filtered_slash_commands();
+        let max_vis = 8usize.min(cmds.len()).min(input_rect.y.saturating_sub(container.y) as usize);
+        if max_vis == 0 {
+            return;
+        }
+        let h = (max_vis as u16) + 2;
+        let w = input_rect.width.clamp(40, 86).min(container.width);
+        let y = input_rect.y.saturating_sub(h);
+        let rect = Rect::new(input_rect.x, y, w, h);
+        app.ui_regions.borrow_mut().popup_rect = Some(rect);
+
+        let inner = popup(f, rect, "SLASH COMMANDS  (↑↓ select · Tab complete · Enter run · Esc close)");
+        let start = app.slash_sel.saturating_sub(max_vis.saturating_sub(1));
+        let mut items: Vec<ListItem> = Vec::new();
+        let mut rows_map = Vec::new();
+
+        for (vis_idx, (cmd_idx, cmd)) in cmds.iter().enumerate().skip(start).take(max_vis).enumerate() {
+            let row_y = inner.y + vis_idx as u16;
+            rows_map.push((row_y, cmd_idx));
+            let badge_style = match &cmd.badge {
+                CommandBadge::Nexus => theme::badge(),
+                CommandBadge::Harness(_) => theme::harness_badge(),
+            };
+            let is_sel = cmd_idx == app.slash_sel;
+            let row_style = if is_sel { theme::selected() } else { theme::panel() };
+            let desc_style = if is_sel { theme::selected() } else { theme::muted() };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!(" {:<16} ", cmd.usage), row_style),
+                Span::styled(format!(" {} ", cmd.badge.label()), badge_style),
+                Span::styled(format!(" {}", first_line(&cmd.description, 44)), desc_style),
+            ])));
+        }
+        app.ui_regions.borrow_mut().popup_rows = rows_map;
+        let mut st = ListState::default().with_selected(Some(app.slash_sel.saturating_sub(start)));
+        f.render_stateful_widget(
+            List::new(items).style(theme::panel()).highlight_style(theme::selected()),
+            inner,
+            &mut st,
+        );
+    } else if app.is_file_popup_active() {
+        let files = app.filtered_files();
+        let max_vis = 8usize.min(files.len()).min(input_rect.y.saturating_sub(container.y) as usize);
+        if max_vis == 0 {
+            return;
+        }
+        let h = (max_vis as u16) + 2;
+        let w = input_rect.width.clamp(40, 80).min(container.width);
+        let y = input_rect.y.saturating_sub(h);
+        let rect = Rect::new(input_rect.x, y, w, h);
+        app.ui_regions.borrow_mut().popup_rect = Some(rect);
+
+        let inner = popup(f, rect, "@FILE AUTOCOMPLETE  (↑↓ select · Tab/Enter insert · Esc close)");
+        let start = app.file_sel.saturating_sub(max_vis.saturating_sub(1));
+        let mut items: Vec<ListItem> = Vec::new();
+        let mut rows_map = Vec::new();
+
+        for (vis_idx, (file_idx, entry)) in files.iter().enumerate().skip(start).take(max_vis).enumerate() {
+            let row_y = inner.y + vis_idx as u16;
+            rows_map.push((row_y, file_idx));
+            let is_sel = file_idx == app.file_sel;
+            let st = if is_sel { theme::selected() } else { theme::panel() };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!(" @{} ", entry.path), st),
+            ])));
+        }
+        app.ui_regions.borrow_mut().popup_rows = rows_map;
+        let mut st = ListState::default().with_selected(Some(app.file_sel.saturating_sub(start)));
+        f.render_stateful_widget(
+            List::new(items).style(theme::panel()).highlight_style(theme::selected()),
+            inner,
+            &mut st,
+        );
+    }
 }
 
 fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
@@ -167,12 +445,12 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
     let mut st = ListState::default().with_selected((!items.is_empty()).then_some(app.project_sel));
     let list = List::new(items)
         .block(block("PROJECTS", focused))
-        .style(theme::base())
+        .style(theme::panel())
         .highlight_style(if focused { theme::selected() } else { theme::bold() });
     f.render_stateful_widget(list, area, &mut st);
 }
 
-fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
+fn draw_sessions_panel(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Sessions && app.overlay.is_none();
     let filter = app.harness_filter.map(|i| HARNESSES[i]).unwrap_or("all");
     let mut title = format!("SESSIONS [{filter}]");
@@ -192,7 +470,7 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!(" {}{phase}", short(&s.harness_session_id, 12)), theme::muted()),
             ]);
             let sum = Line::styled(
-                format!("   {}", first_line(s.summary.as_deref().unwrap_or("(no summary)"), 32)),
+                format!("   {}", first_line(s.summary.as_deref().unwrap_or("(no summary)"), 30)),
                 theme::faint(),
             );
             ListItem::new(vec![head, sum])
@@ -201,27 +479,27 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     let mut st = ListState::default().with_selected((!items.is_empty()).then_some(app.session_sel));
     let list = List::new(items)
         .block(block(&title, focused))
-        .style(theme::base())
+        .style(theme::panel())
         .highlight_style(if focused { theme::selected() } else { theme::bold() });
     f.render_stateful_widget(list, area, &mut st);
 }
 
-/// Render timeline entries into wrapped lines; returns (lines, start line of each entry).
+/// Render timeline entries into wrapped lines; returns `(lines, start_line_of_each_entry)`.
 pub fn timeline_lines(app: &App, width: usize, focused: bool) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines = Vec::new();
     let mut starts = Vec::new();
     for (i, e) in app.timeline.entries.iter().enumerate() {
         starts.push(lines.len());
         let sel = focused && i == app.timeline_sel;
-        let (head, body_style) = entry_header(app, i, e);
+        let (head, bar_style, body_style) = entry_header(app, i, e);
         let head_style = if sel { theme::selected() } else { theme::bold() };
-        let mut spans: Vec<Span> = Vec::new();
+        let mut spans: Vec<Span> = vec![Span::styled("┃ ", if sel { head_style } else { bar_style })];
         for (txt, st) in head {
             spans.push(Span::styled(txt, if sel { head_style } else { st }));
         }
         lines.push(Line::from(spans));
         let body: Option<String> = if e.kind.collapsible() && e.collapsed {
-            let p = first_line(&e.body, width.saturating_sub(6));
+            let p = first_line(&e.body, width.saturating_sub(8));
             (!p.is_empty()).then_some(p)
         } else if e.body.is_empty() {
             None
@@ -229,27 +507,35 @@ pub fn timeline_lines(app: &App, width: usize, focused: bool) -> (Vec<Line<'stat
             Some(e.body.clone())
         };
         if let Some(b) = body {
-            for l in wrap(&b, width.saturating_sub(3)) {
-                lines.push(Line::styled(format!("  │{l}"), body_style));
+            for l in wrap(&b, width.saturating_sub(5)) {
+                lines.push(Line::from(vec![
+                    Span::styled("┃ ", bar_style),
+                    Span::styled(format!("  {l}"), body_style),
+                ]));
             }
         }
-        lines.push(Line::raw(""));
+        lines.push(Line::styled("", theme::base()));
     }
     (lines, starts)
 }
 
-fn entry_header(app: &App, i: usize, e: &Entry) -> (Vec<(String, ratatui::style::Style)>, ratatui::style::Style) {
+fn entry_header(
+    app: &App,
+    i: usize,
+    e: &Entry,
+) -> (Vec<(String, ratatui::style::Style)>, ratatui::style::Style, ratatui::style::Style) {
     let fold = if e.collapsed { "[+]" } else { "[-]" };
     match e.kind {
-        EntryKind::User => (vec![("▶ YOU".into(), theme::badge())], theme::bold()),
-        EntryKind::Text => (vec![("● ASSISTANT".into(), theme::bold())], theme::base()),
+        EntryKind::User => (vec![("▶ YOU".into(), theme::badge())], theme::accent(), theme::bold()),
+        EntryKind::Text => (vec![("● ASSISTANT".into(), theme::bold())], theme::accent(), theme::base()),
         EntryKind::Thinking => (
             vec![(format!("◆ THINKING {fold} ({} chars)", e.body.chars().count()), theme::thinking())],
+            theme::thinking(),
             theme::thinking(),
         ),
         EntryKind::ToolUse => {
             let spin = if app.timeline.tool_pending(i) { format!(" {}", SPINNER[i % 4]) } else { String::new() };
-            (vec![(format!("⚙ TOOL {fold} {}{spin}", e.title), theme::tool())], theme::muted())
+            (vec![(format!("⚙ TOOL {fold} {}{spin}", e.title), theme::tool())], theme::tool(), theme::muted())
         }
         EntryKind::ToolResult => {
             let mut h = vec![(format!("↳ RESULT {fold} {}", e.title), theme::bold())];
@@ -257,30 +543,37 @@ fn entry_header(app: &App, i: usize, e: &Entry) -> (Vec<(String, ratatui::style:
                 h.push((" ".into(), theme::base()));
                 h.push((" ERROR ".into(), theme::error()));
             }
-            (h, if e.is_error { theme::bold() } else { theme::muted() })
+            (h, if e.is_error { theme::error() } else { theme::tool() }, if e.is_error { theme::bold() } else { theme::muted() })
         }
-        EntryKind::Error => (vec![(" ERROR ".into(), theme::error())], theme::bold()),
-        EntryKind::System => (vec![("— system —".into(), theme::faint())], theme::faint()),
+        EntryKind::Shell => {
+            let mut h = vec![(format!("$ SHELL {fold} {}", e.title), theme::shell())];
+            if e.is_error {
+                h.push((" ".into(), theme::base()));
+                h.push((" ERROR ".into(), theme::error()));
+            }
+            (h, theme::shell(), theme::base())
+        }
+        EntryKind::Error => (vec![(" ERROR ".into(), theme::error())], theme::error(), theme::bold()),
+        EntryKind::System => (vec![("— system —".into(), theme::faint())], theme::faint(), theme::faint()),
     }
 }
 
 fn draw_timeline(f: &mut Frame, area: Rect, app: &App) {
+    let pad = if area.width > 70 { 2 } else { 0 };
+    let inner = Rect::new(
+        area.x + pad,
+        area.y,
+        area.width.saturating_sub(pad * 2).max(10),
+        area.height,
+    );
+    app.ui_regions.borrow_mut().timeline_rect = Some(inner);
+
     let focused = app.focus == Focus::Timeline && app.overlay.is_none();
-    let b = block("TIMELINE  thinking · tool_use · tool_result · text", focused);
-    let inner = b.inner(area);
-    f.render_widget(b, area);
-    if app.timeline.entries.is_empty() {
-        f.render_widget(
-            Paragraph::new("Select a session (Enter) or type a prompt below (Tab to input).").style(theme::faint()),
-            inner,
-        );
-        return;
-    }
     let (lines, starts) = timeline_lines(app, inner.width as usize, focused);
     let h = inner.height as usize;
     let total = lines.len();
-    let mut top = total.saturating_sub(h);
-    if focused {
+    let mut top = app.timeline_scroll.unwrap_or_else(|| total.saturating_sub(h));
+    if app.timeline_scroll.is_none() && (focused || !app.timeline.streaming) {
         if let Some(&s) = starts.get(app.timeline_sel) {
             let end = starts.get(app.timeline_sel + 1).copied().unwrap_or(total);
             if s < top {
@@ -289,58 +582,179 @@ fn draw_timeline(f: &mut Frame, area: Rect, app: &App) {
                 top = end.saturating_sub(h).min(s);
             }
         }
-        if !app.timeline.streaming {
-            if let Some(&s) = starts.get(app.timeline_sel) {
-                top = top.min(s);
-            }
+    }
+    top = top.min(total.saturating_sub(1));
+
+    // Record screen Y ranges for each visible timeline entry for mouse click hit-testing.
+    let mut entry_regions = Vec::new();
+    for (idx, &s) in starts.iter().enumerate() {
+        let e_end = starts.get(idx + 1).copied().unwrap_or(total);
+        if e_end > top && s < top + h {
+            let vis_start = s.saturating_sub(top) as u16 + inner.y;
+            let vis_end = (e_end.min(top + h) - top) as u16 + inner.y;
+            entry_regions.push((vis_start, vis_end, idx));
         }
     }
+    app.ui_regions.borrow_mut().timeline_entries = entry_regions;
+
     let visible: Vec<Line> = lines.into_iter().skip(top).take(h).collect();
     f.render_widget(Paragraph::new(Text::from(visible)).style(theme::base()), inner);
-}
-
-fn draw_input(f: &mut Frame, area: Rect, app: &App) {
-    let focused = app.focus == Focus::Input && app.overlay.is_none() && app.prompt.is_none();
-    let cursor = if focused { "█" } else { "" };
-    let title = if app.is_streaming() { "PROMPT (Ctrl+X cancel)" } else { "PROMPT (Enter send)" };
-    let p = Paragraph::new(format!("› {}{cursor}", app.input))
-        .block(block(title, focused))
-        .style(theme::base());
-    f.render_widget(p, area);
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let t = app.timeline.turn_usage;
     let s = app.timeline.total_usage;
-    let usage = Line::from(vec![
-        Span::styled(" TOKENS ", theme::badge()),
-        Span::styled(
-            format!(
-                " turn in {} · out {} · total {} · ${:.4}  │  Σ in {} · out {} · total {} · ${:.4} ",
-                fmt_num(t.input),
-                fmt_num(t.output),
-                fmt_num(t.total),
-                t.cost,
-                fmt_num(s.input),
-                fmt_num(s.output),
-                fmt_num(s.total),
-                s.cost
-            ),
-            theme::footer(),
-        ),
-    ]);
     let status = Line::from(vec![
         Span::styled(format!(" {} ", app.status), theme::bold()),
         Span::styled(
-            "│ Tab focus · Ctrl+B board · Ctrl+L subagents · Ctrl+D diff · Ctrl+R routing · Ctrl+T terminal · Ctrl+K model · F1 help · Ctrl+Q quit",
+            format!(
+                "│ TOKENS in {} · out {} · total {} · ${:.4} ",
+                fmt_num(s.input.max(t.input)),
+                fmt_num(s.output.max(t.output)),
+                fmt_num(s.total.max(t.total)),
+                s.cost.max(t.cost)
+            ),
+            theme::footer(),
+        ),
+        Span::styled(
+            "│ Ctrl+P palette · /sessions · /models · /cd · Ctrl+B board · F1 help · Ctrl+Q quit",
             theme::faint(),
         ),
     ]);
-    f.render_widget(Paragraph::new(vec![usage, status]).style(theme::footer()), area);
+    f.render_widget(Paragraph::new(status).style(theme::footer()), area);
+}
+
+fn draw_sessions_modal(f: &mut Frame, area: Rect, app: &App) {
+    let filter = app.harness_filter.map(|i| HARNESSES[i]).unwrap_or("all");
+    let mut title = format!("SESSIONS [{filter}]  (/sessions)");
+    if !app.search.is_empty() {
+        title.push_str(&format!("  search: {}", app.search));
+    }
+    let inner = popup(f, area, &title);
+    let [list_a, keys] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(inner);
+
+    let idx = app.filtered_sessions();
+    let items: Vec<ListItem> = idx
+        .iter()
+        .map(|&i| {
+            let s = &app.sessions[i];
+            let fg = s.asd_session_id.is_some() && s.asd_session_id == app.foreground_id;
+            let promoted = if fg { "★" } else if s.is_promoted_to_asd { "◆" } else { "◇" };
+            let phase = s.asd_phase.as_deref().map(|p| format!(" [{p}]")).unwrap_or_default();
+            let asd_id = s.asd_session_id.as_deref().unwrap_or("-");
+            let head = Line::from(vec![
+                Span::styled(format!(" {promoted} {:<12}", s.harness), theme::bold()),
+                Span::styled(format!(" {:<18}", short(&s.harness_session_id, 18)), theme::muted()),
+                Span::styled(format!(" asd:{:<14}{phase}", short(asd_id, 14)), theme::faint()),
+            ]);
+            let sum = Line::styled(
+                format!("    {}", first_line(s.summary.as_deref().unwrap_or("(no summary)"), 68)),
+                theme::muted(),
+            );
+            ListItem::new(vec![head, sum])
+        })
+        .collect();
+    let mut st = ListState::default().with_selected((!items.is_empty()).then_some(app.session_sel));
+    f.render_stateful_widget(
+        List::new(items).style(theme::panel()).highlight_style(theme::selected()),
+        list_a,
+        &mut st,
+    );
+    f.render_widget(
+        Paragraph::new(
+            " Enter open · / search · n new · p promote · d demote · u unlink · x del · e memo · f fg · t phase · h filter · Esc close",
+        )
+        .style(theme::faint()),
+        keys,
+    );
+}
+
+fn draw_dir_picker(f: &mut Frame, area: Rect, app: &App) {
+    let inner = popup(f, area, "SWITCH DIRECTORY  (/cd)");
+    let [cur_a, q_a, list_a, keys] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    f.render_widget(
+        Paragraph::new(format!(" current: {}", app.project_root)).style(theme::muted()),
+        cur_a,
+    );
+    f.render_widget(
+        Paragraph::new(format!(" path / filter: {}█", app.dir_query)).style(theme::bold()),
+        q_a,
+    );
+
+    let items_data = app.dir_picker_items();
+    let items: Vec<ListItem> = items_data
+        .iter()
+        .map(|(path, badge)| {
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {:<18} ", badge), theme::muted()),
+                Span::styled(path.clone(), theme::panel()),
+            ]))
+        })
+        .collect();
+    let mut st = ListState::default().with_selected((!items.is_empty()).then_some(app.dir_sel));
+    f.render_stateful_widget(
+        List::new(items).style(theme::panel()).highlight_style(theme::selected()),
+        list_a,
+        &mut st,
+    );
+    f.render_widget(
+        Paragraph::new(" type filter/path · ↑↓ select · Tab drill into dir · Enter switch project · Esc close")
+            .style(theme::faint()),
+        keys,
+    );
+}
+
+fn draw_command_palette(f: &mut Frame, area: Rect, app: &App) {
+    let inner = popup(f, area, "COMMAND PALETTE  (Ctrl+P)");
+    let [q_a, list_a, keys] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    f.render_widget(
+        Paragraph::new(format!(" › {}█", app.palette_query)).style(theme::bold()),
+        q_a,
+    );
+
+    let cmds = app.palette_items();
+    let items: Vec<ListItem> = cmds
+        .iter()
+        .map(|c| {
+            let badge_st = match &c.badge {
+                CommandBadge::Nexus => theme::badge(),
+                CommandBadge::Harness(_) => theme::harness_badge(),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {:<18} ", c.usage), theme::bold()),
+                Span::styled(format!(" {} ", c.badge.label()), badge_st),
+                Span::styled(format!(" {}", c.description), theme::muted()),
+            ]))
+        })
+        .collect();
+    let mut st = ListState::default().with_selected((!items.is_empty()).then_some(app.palette_sel));
+    f.render_stateful_widget(
+        List::new(items).style(theme::panel()).highlight_style(theme::selected()),
+        list_a,
+        &mut st,
+    );
+    f.render_widget(
+        Paragraph::new(" type to search Nexus & harness commands · ↑↓ select · Enter execute · Esc close")
+            .style(theme::faint()),
+        keys,
+    );
 }
 
 fn draw_board(f: &mut Frame, area: Rect, app: &App) {
-    let inner = popup(f, area, "PROGRESS BOARD + PLAN  (Ctrl+B)");
+    let inner = popup(f, area, "PROGRESS BOARD + PLAN  (Ctrl+B / /board)");
     let [info, main, keys] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(inner);
     let (phase, progress, sid) = app
@@ -379,7 +793,7 @@ fn draw_board(f: &mut Frame, area: Rect, app: &App) {
     )
     .header(Row::new(vec!["STATUS", "ID", "SUBJECT", "ROLE", "TURN"]).style(theme::bold()))
     .block(block("TASKS", tf))
-    .style(theme::base())
+    .style(theme::panel())
     .row_highlight_style(if tf { theme::selected() } else { theme::bold() });
     let mut st = TableState::default().with_selected((!app.board_tasks().is_empty()).then_some(app.board_sel));
     f.render_stateful_widget(table, tasks_a, &mut st);
@@ -393,7 +807,7 @@ fn draw_board(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(plan_text)
             .block(block(&title, !tf))
-            .style(theme::base())
+            .style(theme::panel())
             .wrap(Wrap { trim: false })
             .scroll((app.plan_scroll, 0)),
         plan_a,
@@ -406,7 +820,7 @@ fn draw_board(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_subagents(f: &mut Frame, area: Rect, app: &App) {
-    let inner = popup(f, area, "SUBAGENTS + LIVE LOG  (Ctrl+L)");
+    let inner = popup(f, area, "SUBAGENTS + LIVE LOG  (Ctrl+L / /subagents)");
     let [main, keys] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(inner);
     let [list_a, log_a] = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(main);
     let items: Vec<ListItem> = app
@@ -432,14 +846,14 @@ fn draw_subagents(f: &mut Frame, area: Rect, app: &App) {
         .collect();
     let mut st = ListState::default().with_selected((!items.is_empty()).then_some(app.sub_sel));
     f.render_stateful_widget(
-        List::new(items).block(block("SUBAGENTS", true)).style(theme::base()).highlight_style(theme::selected()),
+        List::new(items).block(block("SUBAGENTS", true)).style(theme::panel()).highlight_style(theme::selected()),
         list_a,
         &mut st,
     );
     let h = log_a.height.saturating_sub(2) as usize;
     let start = app.logs.len().saturating_sub(h);
     let log: Vec<Line> = app.logs[start..].iter().map(|l| Line::styled(l.clone(), theme::muted())).collect();
-    f.render_widget(Paragraph::new(log).block(block("LOG TAIL", false)).style(theme::base()), log_a);
+    f.render_widget(Paragraph::new(log).block(block("LOG TAIL", false)).style(theme::panel()), log_a);
     f.render_widget(
         Paragraph::new(" ↑↓ select · x kill · r retry · f fallback (current harness/model) · u resume · c custom · F5 refresh · Esc close")
             .style(theme::faint()),
@@ -448,7 +862,7 @@ fn draw_subagents(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_diff(f: &mut Frame, area: Rect, app: &App) {
-    let inner = popup(f, area, "WORKTREE DIFF  (Ctrl+D)");
+    let inner = popup(f, area, "WORKTREE DIFF  (Ctrl+D / /diff)");
     let [main, keys] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(inner);
     let [list_a, diff_a] = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).areas(main);
     let items: Vec<ListItem> = app
@@ -458,7 +872,7 @@ fn draw_diff(f: &mut Frame, area: Rect, app: &App) {
         .collect();
     let mut st = ListState::default().with_selected((!items.is_empty()).then_some(app.diff_sel));
     f.render_stateful_widget(
-        List::new(items).block(block("TASKS", true)).style(theme::base()).highlight_style(theme::selected()),
+        List::new(items).block(block("TASKS", true)).style(theme::panel()).highlight_style(theme::selected()),
         list_a,
         &mut st,
     );
@@ -484,13 +898,13 @@ fn draw_diff(f: &mut Frame, area: Rect, app: &App) {
                         file.additions.unwrap_or(0),
                         file.deletions.unwrap_or(0)
                     ),
-                    theme::base(),
+                    theme::panel(),
                 ));
             }
             if let Some(e) = &d.error {
                 lines.push(Line::styled(format!(" ERROR {e}"), theme::error()));
             }
-            lines.push(Line::raw(""));
+            lines.push(Line::styled("", theme::panel()));
             for l in d.diff_text.as_deref().unwrap_or("").lines() {
                 let st = if l.starts_with('+') && !l.starts_with("+++") {
                     theme::diff_add()
@@ -506,7 +920,7 @@ fn draw_diff(f: &mut Frame, area: Rect, app: &App) {
         }
     }
     f.render_widget(
-        Paragraph::new(lines).block(block("DIFF", false)).style(theme::base()).scroll((app.diff_scroll, 0)),
+        Paragraph::new(lines).block(block("DIFF", false)).style(theme::panel()).scroll((app.diff_scroll, 0)),
         diff_a,
     );
     f.render_widget(
@@ -518,7 +932,11 @@ fn draw_diff(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_routing(f: &mut Frame, area: Rect, app: &App) {
     let editing = app.routing_editor.is_some();
-    let inner = popup(f, area, if editing { "ROUTING CONFIG — EDITING  (Ctrl+R)" } else { "ROUTING CONFIG  (Ctrl+R)" });
+    let inner = popup(
+        f,
+        area,
+        if editing { "ROUTING CONFIG — EDITING  (Ctrl+R)" } else { "ROUTING CONFIG  (Ctrl+R / /routing)" },
+    );
     let [main, keys] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(inner);
     if let Some(ed) = &app.routing_editor {
         let h = main.height as usize;
@@ -535,16 +953,16 @@ fn draw_routing(f: &mut Frame, area: Rect, app: &App) {
                     let mut bc = b.chars();
                     let cur = bc.next().map(|c| c.to_string()).unwrap_or_else(|| " ".into());
                     Line::from(vec![
-                        Span::styled(a, theme::base()),
+                        Span::styled(a, theme::panel()),
                         Span::styled(cur, theme::selected()),
-                        Span::styled(bc.collect::<String>(), theme::base()),
+                        Span::styled(bc.collect::<String>(), theme::panel()),
                     ])
                 } else {
-                    Line::styled(l.clone(), theme::base())
+                    Line::styled(l.clone(), theme::panel())
                 }
             })
             .collect();
-        f.render_widget(Paragraph::new(lines).style(theme::base()), main);
+        f.render_widget(Paragraph::new(lines).style(theme::panel()), main);
         f.render_widget(Paragraph::new(" Ctrl+S save (POST /api/routing) · Esc cancel edit").style(theme::faint()), keys);
     } else {
         let text = app
@@ -552,7 +970,7 @@ fn draw_routing(f: &mut Frame, area: Rect, app: &App) {
             .as_ref()
             .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
             .unwrap_or_else(|| "Loading GET /api/routing…".into());
-        f.render_widget(Paragraph::new(text).style(theme::base()).scroll((app.routing_scroll, 0)), main);
+        f.render_widget(Paragraph::new(text).style(theme::panel()).scroll((app.routing_scroll, 0)), main);
         f.render_widget(
             Paragraph::new(" ↑↓ scroll · e edit · x reset to defaults · r reload · Esc close").style(theme::faint()),
             keys,
@@ -561,15 +979,18 @@ fn draw_routing(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_terminal(f: &mut Frame, area: Rect, app: &App) {
-    let inner = popup(f, area, "INTERACTIVE RESUME / OS TERMINAL  (Ctrl+T)");
+    let inner = popup(f, area, "INTERACTIVE RESUME / OS TERMINAL  (Ctrl+T / /terminal)");
     let mut lines = vec![];
     match &app.resume {
         None => lines.push(Line::styled("No resume command loaded (select an ASD session).", theme::faint())),
         Some(r) => {
-            lines.push(Line::from(vec![Span::styled(" HARNESS ", theme::badge()), Span::styled(format!(" {}", r.harness), theme::bold())]));
+            lines.push(Line::from(vec![
+                Span::styled(" HARNESS ", theme::badge()),
+                Span::styled(format!(" {}", r.harness), theme::bold()),
+            ]));
             lines.push(Line::styled(format!("session  {}", r.harness_session_id.as_deref().unwrap_or("-")), theme::muted()));
             lines.push(Line::styled(format!("cwd      {}", r.cwd), theme::muted()));
-            lines.push(Line::raw(""));
+            lines.push(Line::styled("", theme::panel()));
             lines.push(Line::styled("command:", theme::bold()));
             lines.push(Line::styled(format!("  {}", r.cli_string), theme::selected()));
             if let Some(e) = &r.error {
@@ -577,7 +998,7 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    lines.push(Line::raw(""));
+    lines.push(Line::styled("", theme::panel()));
     let kinds: Vec<Span> = TERMINALS
         .iter()
         .enumerate()
@@ -589,13 +1010,16 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     lines.push(Line::from(kinds));
-    lines.push(Line::raw(""));
-    lines.push(Line::styled("Enter/o launch in OS terminal · k/Tab terminal kind · r reload · Esc close", theme::faint()));
-    f.render_widget(Paragraph::new(lines).style(theme::base()).wrap(Wrap { trim: false }), inner);
+    lines.push(Line::styled("", theme::panel()));
+    lines.push(Line::styled(
+        "Enter/o launch in OS terminal · k/Tab terminal kind · r reload · Esc close",
+        theme::faint(),
+    ));
+    f.render_widget(Paragraph::new(lines).style(theme::panel()).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_picker(f: &mut Frame, area: Rect, app: &App) {
-    let inner = popup(f, area, "HARNESS & MODEL  (Ctrl+K)");
+    let inner = popup(f, area, "HARNESS & MODEL  (Ctrl+K / /models)");
     let [tabs, q, list_a, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -606,9 +1030,14 @@ fn draw_picker(f: &mut Frame, area: Rect, app: &App) {
     let spans: Vec<Span> = HARNESSES
         .iter()
         .enumerate()
-        .map(|(i, h)| Span::styled(format!(" {h} "), if i == app.picker_harness { theme::selected() } else { theme::muted() }))
+        .map(|(i, h)| {
+            Span::styled(
+                format!(" {h} "),
+                if i == app.picker_harness { theme::selected() } else { theme::muted() },
+            )
+        })
         .collect();
-    f.render_widget(Paragraph::new(Line::from(spans)), tabs);
+    f.render_widget(Paragraph::new(Line::from(spans)).style(theme::panel()), tabs);
     f.render_widget(Paragraph::new(format!(" search: {}█", app.picker_query)).style(theme::bold()), q);
     let models = app.picker_models();
     let items: Vec<ListItem> = models
@@ -621,7 +1050,7 @@ fn draw_picker(f: &mut Frame, area: Rect, app: &App) {
         .collect();
     let mut st = ListState::default().with_selected(Some(app.picker_sel));
     f.render_stateful_widget(
-        List::new(items).style(theme::base()).highlight_style(theme::selected()),
+        List::new(items).style(theme::panel()).highlight_style(theme::selected()),
         list_a,
         &mut st,
     );
@@ -633,19 +1062,24 @@ fn draw_picker(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let inner = popup(f, area, "HELP");
+    let inner = popup(f, area, "HELP  (F1 / /help)");
     let rows = [
-        ("Global", "Tab/Shift+Tab focus · Ctrl+Q/Ctrl+C quit · Ctrl+X cancel turn · Ctrl+E fold/unfold all · F1 help"),
-        ("Overlays", "Ctrl+B board+PLAN · Ctrl+L subagents · Ctrl+D diff · Ctrl+R routing · Ctrl+T terminal · Ctrl+K model"),
-        ("Projects", "↑↓/jk select · Enter switch project · r refresh"),
-        ("Sessions", "Enter open · n new · p promote · d demote · u unlink · x delete · e memo · f foreground"),
-        ("", "t toggle phase · / search · h harness filter · H cycle harness · m model picker · r refresh"),
-        ("Timeline", "↑↓/jk select · Enter/Space fold thinking/tool blocks · i input"),
-        ("Prompt", "type · Enter send (SSE stream) · Esc back"),
+        ("Slash Cmds", "/sessions (/s) · /cd [dir] · /new · /models · /harness [name] · /theme · /sidebar · /clear · /exit"),
+        ("Harness /", "Any harness command (e.g. /compact, /asd, /review) appears in / popup & sends to turn stream"),
+        ("@ & !", "@path attaches file with autocomplete · !cmd runs local shell in project_root"),
+        ("Input", "Enter send · Shift+Enter/Alt+Enter newline · ↑↓←→/Home/End cursor · Tab switch harness"),
+        ("Palette", "Ctrl+P command palette · Ctrl+K model picker · Ctrl+X cancel stream · Ctrl+E fold/unfold all"),
+        ("Modals", "Ctrl+B board+PLAN · Ctrl+L subagents · Ctrl+D diff · Ctrl+R routing · Ctrl+T OS terminal"),
+        ("Mouse", "Wheel scrolls timeline/modals · Click selects / or @ popup item or folds Thinking/Tool cards"),
     ];
     let lines: Vec<Line> = rows
         .iter()
-        .map(|(a, b)| Line::from(vec![Span::styled(format!(" {a:<10}"), theme::bold()), Span::styled(*b, theme::muted())]))
+        .map(|(a, b)| {
+            Line::from(vec![
+                Span::styled(format!(" {a:<12}"), theme::bold()),
+                Span::styled(*b, theme::muted()),
+            ])
+        })
         .collect();
-    f.render_widget(Paragraph::new(lines).style(theme::base()).wrap(Wrap { trim: false }), inner);
+    f.render_widget(Paragraph::new(lines).style(theme::panel()).wrap(Wrap { trim: false }), inner);
 }
