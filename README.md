@@ -1,5 +1,7 @@
 # ASD-Nexus
 
+English | [한국어](README.ko.md)
+
 A native, WebView-free control plane for the `agent-swarm-director` (ASD) multi-agent runtime. ASD-Nexus pairs a Node HTTP/SSE sidecar with a Rust workspace that ships a desktop GUI, a TUI, and a scriptable CLI.
 
 It drives five harnesses from one place: `claude-code`, `codex`, `opencode`, `antigravity`, and `cursor`.

@@ -1,5 +1,7 @@
 # ASD-Nexus
 
+[English](README.md) | 한국어
+
 `agent-swarm-director`(ASD) 멀티 에이전트 런타임을 위한 네이티브 컨트롤 플레인입니다. WebView 없이 Node HTTP/SSE 사이드카와 Rust 워크스페이스(데스크톱 GUI, TUI, 스크립트 CLI)로 구성됩니다.
 
 `claude-code`, `codex`, `opencode`, `antigravity`, `cursor` 5개 하네스를 한 곳에서 제어합니다.
