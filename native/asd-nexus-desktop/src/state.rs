@@ -85,7 +85,8 @@ pub const NEXUS_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("sessions", "Browse or switch sessions"),
     ("new", "Start a new chat session in active harness"),
     ("models", "Refresh available models for harnesses"),
-    ("harness", "Switch active harness and open new session (/harness <name>)"),
+    ("harness", "Switch active harness (/harness <name>, new chat only)"),
+    ("auto-approve", "Toggle auto-approve tool permissions (/auto-approve [on|off])"),
     ("dashboard", "Switch to Dashboard orchestration view"),
     ("theme", "Toggle Dark / Monochrome theme"),
     ("clear", "Clear current chat timeline"),
@@ -114,10 +115,18 @@ pub fn extract_slash_query(composer: &str) -> Option<&str> {
 
 /// Build filtered slash autocomplete items combining `[nexus]` built-ins and
 /// `[<harness>]` specific commands from `GET /api/harness-commands`.
-pub fn build_slash_items(query: &str, harness: &str, harness_cmds: &[HarnessCommandItem]) -> Vec<SlashPopupItem> {
+pub fn build_slash_items(
+    query: &str,
+    harness: &str,
+    harness_cmds: &[HarnessCommandItem],
+    allow_harness_switch: bool,
+) -> Vec<SlashPopupItem> {
     let needle = query.trim().to_ascii_lowercase();
     let mut out = Vec::new();
     for (name, desc) in NEXUS_SLASH_COMMANDS {
+        if *name == "harness" && !allow_harness_switch {
+            continue;
+        }
         if needle.is_empty()
             || name.to_ascii_lowercase().contains(&needle)
             || desc.to_ascii_lowercase().contains(&needle)
@@ -569,9 +578,15 @@ mod tests {
             kind: HarnessCommandKind::Command,
             path: None,
         }];
-        let all = build_slash_items("", "claude-code", &h_cmds);
+        let all = build_slash_items("", "claude-code", &h_cmds, true);
         assert!(all.iter().any(|i| i.is_nexus && i.name == "cd" && i.badge == "nexus"));
+        assert!(all.iter().any(|i| i.is_nexus && i.name == "harness" && i.badge == "nexus"));
+        assert!(all.iter().any(|i| i.is_nexus && i.name == "auto-approve" && i.badge == "nexus"));
         assert!(all.iter().any(|i| !i.is_nexus && i.name == "compact" && i.badge == "claude-code"));
+
+        let locked = build_slash_items("", "claude-code", &h_cmds, false);
+        assert!(!locked.iter().any(|i| i.name == "harness"));
+        assert!(locked.iter().any(|i| i.name == "auto-approve"));
 
         assert_eq!(extract_at_query("@src/ma"), Some((0, "src/ma")));
         assert_eq!(extract_at_query("check @Cargo.to"), Some((6, "Cargo.to")));

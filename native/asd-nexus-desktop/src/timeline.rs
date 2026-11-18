@@ -275,6 +275,15 @@ impl Timeline {
                 self.push(EntryKind::Error, evt.harness.clone().unwrap_or_default(), msg);
             }
             OrchestratorEventKind::Status => {}
+            OrchestratorEventKind::PermissionRequest => {
+                if let Some(perm) = &evt.permission_request {
+                    self.push(
+                        EntryKind::System,
+                        "permission",
+                        format!("Permission requested: {}", perm.tool_name),
+                    );
+                }
+            }
         }
         if let Some(u) = &evt.usage {
             if evt.kind != OrchestratorEventKind::Usage {

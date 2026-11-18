@@ -68,6 +68,7 @@ fn populate(app: &mut NexusApp) {
                 asd_session_id: Some("asd-1".into()),
                 asd_phase: Some("running".into()),
                 is_promoted_to_asd: true,
+                auto_approve: Some(true),
             },
             DiscoveredSessionItem {
                 harness: "codex".into(),
@@ -80,6 +81,7 @@ fn populate(app: &mut NexusApp) {
                 asd_session_id: None,
                 asd_phase: None,
                 is_promoted_to_asd: false,
+                auto_approve: None,
             },
         ],
         active_session_id: Some("asd-1".into()),
@@ -407,13 +409,34 @@ fn slash_and_at_autocomplete_popups_render_and_apply() {
 }
 
 #[test]
-fn manual_harness_change_resets_state_and_auto_creates_new_session() {
+fn manual_harness_change_resets_state_and_locks_on_started_session() {
+    let ctx = ctx();
     let mut app = NexusApp::new("C:/p", RunOptions::default());
     populate(&mut app);
 
-    // Select an existing session first (from left sidebar): should NOT emit CreateSession
+    // 1. Initial state is New Session draft: harness CAN be changed freely without creating a session.
+    assert!(!app.is_session_started());
+    assert!(app.active_session_id.is_none(), "draft must not adopt active_session_id from Reply::Sessions");
+    app.backend.submitted.clear();
+    app.change_harness_manually(3); // antigravity
+    assert_eq!(app.chat.harness(), "antigravity");
+    assert!(!app.is_session_started(), "harness change in draft stays in draft");
+    assert!(
+        !app.backend.submitted.iter().any(|r| matches!(r, Request::CreateSession(_))),
+        "harness change in draft must not eagerly emit CreateSession"
+    );
+    assert!(
+        app.backend.submitted.iter().any(|r| matches!(
+            r,
+            Request::HarnessCommands(req) if req.harness.as_deref() == Some("antigravity")
+        )),
+        "harness change in draft must refresh harness_commands"
+    );
+
+    // 2. Select an existing session from left sidebar: locks harness (`is_session_started() == true`).
     app.backend.submitted.clear();
     app.select_session(0);
+    assert!(app.is_session_started());
     assert_eq!(app.chat.harness(), "claude-code");
     assert_eq!(app.active_session_id.as_deref(), Some("asd-1"));
     assert!(app.selected_session.is_some());
@@ -422,50 +445,166 @@ fn manual_harness_change_resets_state_and_auto_creates_new_session() {
         "selecting an existing session must not overwrite with CreateSession"
     );
 
-    // Add some timeline & resume state to verify reset on manual harness switch
-    app.chat.timeline.push(EntryKind::User, "", "existing message");
-    app.handle_reply(Reply::ResumeCommand(Ok(GetResumeCommandResponse {
-        success: true,
-        harness: "claude-code".into(),
-        harness_session_id: Some("cc-111".into()),
-        command: "claude".into(),
-        args: vec!["--resume".into(), "cc-111".into()],
-        cli_string: "claude --resume cc-111".into(),
-        cwd: "C:/p".into(),
-        error: None,
-    })));
-    assert!(!app.chat.timeline.entries.is_empty());
-    assert!(app.terminal.resume.is_some());
+    // While started, harness switching via API, `/harness`, slash popup, and palette are all blocked.
+    app.change_harness_manually(3);
+    assert_eq!(app.chat.harness(), "claude-code", "harness must stay locked");
+    assert!(app.status.contains("locked"));
 
-    // Now manually change harness from `claude-code` (0) to `antigravity` (3)
-    app.backend.submitted.clear();
+    app.chat.composer = "/harness codex".into();
+    app.send_prompt();
+    assert_eq!(app.chat.harness(), "claude-code", "/harness must be blocked when started");
+    assert!(app.status.contains("locked"));
+
+    app.chat.composer = "/".into();
+    assert!(
+        !app.current_slash_items().iter().any(|i| i.name == "harness"),
+        "/harness must be hidden from slash popup when session is started"
+    );
+    app.chat.composer.clear();
+
+    let palette_entries = app.build_palette_entries();
+    assert!(
+        !palette_entries.iter().any(|e| matches!(e.action, PaletteAction::SwitchHarness(_))),
+        "SwitchHarness must be hidden from Command Palette when session is started"
+    );
+    assert!(
+        !palette_entries
+            .iter()
+            .any(|e| matches!(e.action, PaletteAction::SelectModel(h_idx, _) if h_idx != app.chat.harness_idx)),
+        "Command Palette must only list models for the locked harness"
+    );
+
+    // Model selection STILL works on a started session!
+    app.execute_palette_action(PaletteAction::SelectModel(0, Some("opus".into())), Some(&ctx));
+    assert_eq!(app.chat.picker.selected.as_deref(), Some("opus"));
+    assert_eq!(app.chat.harness(), "claude-code");
+
+    // Render started Chat in DarkColor and Monochrome (read-only harness badge, no ComboBox)
+    let _ = frame(&ctx, &mut app, vec![]);
+    app.set_theme_mode(&ctx, ThemeMode::Monochrome);
+    let out = frame(&ctx, &mut app, vec![]);
+    assert!(assert_grayscale_output(&ctx, out) > 100);
+    app.set_theme_mode(&ctx, ThemeMode::DarkColor);
+
+    // 3. `/new` (or + New Chat) re-enters New Session draft where harness CAN be changed again.
+    app.chat.composer = "/new".into();
+    app.send_prompt();
+    assert!(!app.is_session_started());
+    assert!(app.active_session_id.is_none());
+    assert!(app.selected_session.is_none());
+    assert!(app.chat.timeline.entries.is_empty());
+
     app.change_harness_manually(3);
     assert_eq!(app.chat.harness(), "antigravity");
-    assert!(app.selected_session.is_none(), "selected_session must be cleared");
-    assert!(app.active_session_id.is_none(), "active_session_id must be cleared");
-    assert!(app.chat.timeline.entries.is_empty(), "chat.timeline must be cleared");
-    assert!(app.terminal.resume.is_none(), "terminal.resume must be cleared");
 
-    // Verify CreateSession and HarnessCommands requests were dispatched for `antigravity`
-    let has_create = app.backend.submitted.iter().any(|r| match r {
-        Request::CreateSession(req) => req.harness.as_deref() == Some("antigravity"),
+    // 4. Sending a prompt on a connected draft creates a fresh session (`session_id: None`) and locks harness.
+    app.backend.set_client(Some(NexusClient::new("http://127.0.0.1:9", None)));
+    app.chat.turn_seq = None;
+    app.backend.submitted.clear();
+    app.chat.composer = "hello new session".into();
+    app.send_prompt();
+    assert!(app.is_session_started(), "sending a prompt must lock the session");
+    let has_start_turn = app.backend.submitted.iter().any(|r| match r {
+        Request::StartTurn { req, .. } => req.session_id.is_none() && req.harness == "antigravity",
         _ => false,
     });
-    let has_cmds = app.backend.submitted.iter().any(|r| match r {
-        Request::HarnessCommands(req) => req.harness.as_deref() == Some("antigravity"),
-        _ => false,
-    });
-    assert!(has_create, "manual harness switch must auto-call create_session()");
-    assert!(has_cmds, "manual harness switch must refresh harness_commands");
+    assert!(has_start_turn, "first turn from draft must send session_id=None on chosen harness");
 
     // Simulate CreateSession reply arriving from backend
     app.handle_reply(Reply::CreateSession(Ok(CreateSessionResponse {
         success: true,
         session_id: "asd-new-agy".into(),
         phase: SessionPhase::Planning,
+        auto_approve: Some(true),
         error: None,
     })));
     assert_eq!(app.active_session_id.as_deref(), Some("asd-new-agy"));
+    assert!(app.is_session_started());
+}
+
+#[test]
+fn auto_approve_toggle_and_permission_modal_flow() {
+    let ctx = ctx();
+    let mut app = NexusApp::new("C:/p", RunOptions::default());
+    populate(&mut app);
+    app.select_session(0);
+    assert!(app.chat.auto_approve);
+
+    // 1. Toggling auto_approve on an active session dispatches Request::SetSessionAutoApprove
+    app.backend.submitted.clear();
+    app.set_auto_approve(false);
+    assert!(!app.chat.auto_approve);
+    let sent_toggle = app.backend.submitted.iter().any(|r| match r {
+        Request::SetSessionAutoApprove(req) => req.session_id == "asd-1" && !req.auto_approve,
+        _ => false,
+    });
+    assert!(sent_toggle, "set_auto_approve must dispatch Request::SetSessionAutoApprove");
+
+    // `/auto-approve on` slash command also updates and dispatches
+    app.backend.submitted.clear();
+    app.chat.composer = "/auto-approve on".into();
+    app.send_prompt();
+    assert!(app.chat.auto_approve);
+    assert!(app.backend.submitted.iter().any(|r| match r {
+        Request::SetSessionAutoApprove(req) => req.session_id == "asd-1" && req.auto_approve,
+        _ => false,
+    }));
+
+    // 2. Receiving PermissionRequest SSE event populates pending_permissions & renders cleanly in DarkColor + Monochrome
+    app.chat.turn_seq = Some(42);
+    app.chat.timeline.begin_turn("run bash");
+    let perm_ev = ev(
+        r#"{
+            "kind": "permission_request",
+            "turnId": "turn-perm-1",
+            "sessionId": "asd-1",
+            "permissionRequest": {
+                "requestId": "req-99",
+                "toolName": "Bash",
+                "toolKind": "execute",
+                "toolInput": "{\"command\":\"echo hi\"}",
+                "locations": ["src/main.rs"],
+                "options": [
+                    {"optionId": "allow_once", "name": "Allow Once", "kind": "allow_once"},
+                    {"optionId": "allow_always", "name": "Allow Always", "kind": "allow_always"},
+                    {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                ]
+            }
+        }"#,
+    );
+    app.handle_reply(Reply::Stream { seq: 42, msg: perm_ev });
+    assert_eq!(app.chat.pending_permissions.len(), 1);
+    assert_eq!(app.chat.pending_permissions[0].1.tool_name, "Bash");
+
+    // Render modal in DarkColor
+    let _ = frame(&ctx, &mut app, vec![]);
+    let out_dark = frame(&ctx, &mut app, vec![]);
+    let (total_dark, colored_dark) = count_colored_vertices(&ctx, out_dark);
+    assert!(total_dark > 100 && colored_dark > 0);
+
+    // Render modal in strict Monochrome grayscale
+    app.set_theme_mode(&ctx, ThemeMode::Monochrome);
+    let _ = frame(&ctx, &mut app, vec![]);
+    let out_mono = frame(&ctx, &mut app, vec![]);
+    assert!(assert_grayscale_output(&ctx, out_mono) > 100);
+    app.set_theme_mode(&ctx, ThemeMode::DarkColor);
+
+    // 3. Responding with `allow_always` pops pending_permissions, flips auto_approve=true, and dispatches SubmitTurnPermission
+    app.chat.auto_approve = false;
+    app.backend.submitted.clear();
+    app.respond_to_permission("selected", Some("allow_always".into()));
+    assert!(app.chat.pending_permissions.is_empty());
+    assert!(app.chat.auto_approve, "allow_always must update auto_approve=true locally");
+    let sent_perm = app.backend.submitted.iter().any(|r| match r {
+        Request::SubmitTurnPermission(req) => {
+            req.turn_id == "turn-perm-1"
+                && req.request_id == "req-99"
+                && req.outcome == "selected"
+                && req.option_id.as_deref() == Some("allow_always")
+        }
+        _ => false,
+    });
+    assert!(sent_perm, "respond_to_permission must dispatch Request::SubmitTurnPermission");
 }
 
 #[test]

@@ -28,7 +28,6 @@ pub enum ConnState {
     Failed(String),
 }
 
-#[derive(Default)]
 pub struct ChatState {
     pub harness_idx: usize,
     pub picker: ModelPicker,
@@ -42,6 +41,31 @@ pub struct ChatState {
     pub last_at_prefix: Option<String>,
     pub popup_selected: usize,
     pub session_filter: String,
+    pub new_session_draft: bool,
+    pub auto_approve: bool,
+    pub pending_permissions: VecDeque<(String, PermissionRequestPayload)>,
+}
+
+impl Default for ChatState {
+    fn default() -> Self {
+        Self {
+            harness_idx: 0,
+            picker: ModelPicker::default(),
+            timeline: Timeline::default(),
+            composer: String::new(),
+            turn_seq: None,
+            handle: None,
+            cancel_requested: false,
+            harness_commands: Vec::new(),
+            fs_entries: Vec::new(),
+            last_at_prefix: None,
+            popup_selected: 0,
+            session_filter: String::new(),
+            new_session_draft: true,
+            auto_approve: true,
+            pending_permissions: VecDeque::new(),
+        }
+    }
 }
 
 impl ChatState {
@@ -397,6 +421,8 @@ impl NexusApp {
         self.sessions.clear();
         self.selected_session = None;
         self.active_session_id = None;
+        self.chat.new_session_draft = true;
+        self.chat.pending_permissions.clear();
         if !self.chat.is_streaming() {
             self.chat.timeline.clear();
         }
@@ -436,12 +462,32 @@ impl NexusApp {
         }
     }
 
+    pub fn is_session_started(&self) -> bool {
+        !self.chat.new_session_draft
+    }
+
+    /// Enter a fresh New Session draft (unlocks the harness selector without
+    /// creating a backend session until the user sends a prompt).
+    pub fn start_new_session_draft(&mut self) {
+        if self.chat.is_streaming() {
+            self.cancel_turn();
+        }
+        self.chat.new_session_draft = true;
+        self.selected_session = None;
+        self.active_session_id = None;
+        self.chat.timeline.clear();
+        self.terminal.resume = None;
+        self.chat.pending_permissions.clear();
+        self.set_status("new session — choose harness & model, then send message");
+    }
+
     /// Manually switch the active harness from the Chat composer dropdown,
-    /// `/harness`, or Command Palette:
-    /// - Resets `selected_session`, `active_session_id`, `chat.timeline`, `terminal.resume`
-    /// - Automatically calls `create_session()` for the new harness
-    /// - Refreshes `harness_commands` for the new harness
+    /// `/harness`, or Command Palette (only allowed while in New Session draft).
     pub fn change_harness_manually(&mut self, new_harness_idx: usize) {
+        if self.is_session_started() {
+            self.set_status("harness is locked for started session; click + New Chat (/new) first");
+            return;
+        }
         if new_harness_idx >= HARNESSES.len() || new_harness_idx == self.chat.harness_idx {
             return;
         }
@@ -454,7 +500,6 @@ impl NexusApp {
         self.terminal.resume = None;
         self.chat.harness_commands.clear();
         self.refresh_harness_commands();
-        self.create_session();
     }
 
     /// Manually switch the active harness by name (e.g. `"claude-code"`, `"codex"`).
@@ -468,9 +513,12 @@ impl NexusApp {
     }
 
     /// Select an existing session from the left sidebar (follows the session's
-    /// harness without overwriting or creating a new session).
+    /// harness without overwriting or creating a new session, and locks harness).
     pub fn select_session(&mut self, idx: usize) {
         let Some(s) = self.sessions.get(idx).cloned() else { return };
+        self.chat.new_session_draft = false;
+        self.chat.auto_approve = s.auto_approve.unwrap_or(true);
+        self.chat.pending_permissions.clear();
         self.selected_session = Some((s.harness.clone(), s.harness_session_id.clone()));
         self.active_session_id = s.asd_session_id.clone();
         if let Some(i) = HARNESSES.iter().position(|h| *h == s.harness) {
@@ -516,8 +564,59 @@ impl NexusApp {
             title: None,
             memo: None,
             make_foreground: Some(true),
+            auto_approve: Some(self.chat.auto_approve),
         };
-        self.request(Request::CreateSession(req));
+        match self.backend.submit(Request::CreateSession(req)) {
+            Ok(_) => {
+                self.chat.new_session_draft = false;
+            }
+            Err(e) => self.set_status(e),
+        }
+    }
+
+    /// Update auto-approve locally and persist to the backend if a session is active.
+    pub fn set_auto_approve(&mut self, enabled: bool) {
+        self.chat.auto_approve = enabled;
+        self.set_status(format!("auto-approve: {}", if enabled { "ON" } else { "OFF" }));
+        if let Some(sid) = self.active_session_id.clone() {
+            self.request(Request::SetSessionAutoApprove(SetSessionAutoApproveRequest {
+                project_root: self.root_opt(),
+                session_id: sid,
+                auto_approve: enabled,
+            }));
+        }
+    }
+
+    /// Pop the front pending permission request and submit the user's decision.
+    pub fn respond_to_permission(&mut self, outcome: &str, option_id: Option<String>) {
+        let Some((mut turn_id, perm)) = self.chat.pending_permissions.pop_front() else {
+            return;
+        };
+        if turn_id.is_empty() {
+            turn_id = self
+                .chat
+                .timeline
+                .turn_id
+                .clone()
+                .or_else(|| self.chat.handle.as_ref().and_then(|h| h.turn_id()))
+                .unwrap_or_default();
+        }
+        if let Some(ref oid) = option_id {
+            let is_allow_always = perm
+                .options
+                .iter()
+                .any(|o| &o.option_id == oid && o.kind == "allow_always")
+                || (perm.options.is_empty() && oid == "allow_always");
+            if is_allow_always {
+                self.chat.auto_approve = true;
+            }
+        }
+        self.request(Request::SubmitTurnPermission(TurnPermissionDecisionRequest {
+            turn_id,
+            request_id: perm.request_id,
+            outcome: outcome.to_string(),
+            option_id,
+        }));
     }
 
     pub fn promote_selected(&mut self) {
@@ -538,7 +637,12 @@ impl NexusApp {
     /// Current `/` autocomplete items when the composer is typing a slash command.
     pub fn current_slash_items(&self) -> Vec<SlashPopupItem> {
         match extract_slash_query(&self.chat.composer) {
-            Some(q) => build_slash_items(q, self.chat.harness(), &self.chat.harness_commands),
+            Some(q) => build_slash_items(
+                q,
+                self.chat.harness(),
+                &self.chat.harness_commands,
+                !self.is_session_started(),
+            ),
             None => Vec::new(),
         }
     }
@@ -565,7 +669,7 @@ impl NexusApp {
             match item.name.as_str() {
                 "new" => {
                     self.chat.composer.clear();
-                    self.create_session();
+                    self.start_new_session_draft();
                 }
                 "models" => {
                     self.chat.composer.clear();
@@ -599,7 +703,16 @@ impl NexusApp {
                     self.chat.composer = "/cd ".to_string();
                 }
                 "harness" => {
-                    self.chat.composer = "/harness ".to_string();
+                    if self.is_session_started() {
+                        self.chat.composer.clear();
+                        self.set_status("harness is locked for started session; click + New Chat (/new) first");
+                    } else {
+                        self.chat.composer = "/harness ".to_string();
+                    }
+                }
+                "auto-approve" => {
+                    self.chat.composer.clear();
+                    self.set_auto_approve(!self.chat.auto_approve);
                 }
                 _ => {
                     self.chat.composer = format!("/{} ", item.name);
@@ -631,7 +744,7 @@ impl NexusApp {
         match cmd {
             "new" if arg.is_empty() => {
                 self.chat.composer.clear();
-                self.create_session();
+                self.start_new_session_draft();
                 true
             }
             "models" if arg.is_empty() => {
@@ -683,12 +796,28 @@ impl NexusApp {
             }
             "harness" => {
                 self.chat.composer.clear();
-                if arg.is_empty() {
+                if self.is_session_started() {
+                    self.set_status("harness is locked for started session; click + New Chat (/new) first");
+                } else if arg.is_empty() {
                     let next = (self.chat.harness_idx + 1) % HARNESSES.len();
                     self.change_harness_manually(next);
                 } else if !self.change_harness_by_name(arg) {
                     self.set_status(format!("unknown harness: {arg}"));
                 }
+                true
+            }
+            "auto-approve" => {
+                self.chat.composer.clear();
+                let next = match arg.to_ascii_lowercase().as_str() {
+                    "" | "toggle" => !self.chat.auto_approve,
+                    "on" | "true" | "1" | "enable" => true,
+                    "off" | "false" | "0" | "disable" => false,
+                    other => {
+                        self.set_status(format!("unknown auto-approve argument: {other} (use on/off)"));
+                        return true;
+                    }
+                };
+                self.set_auto_approve(next);
                 true
             }
             _ => false,
@@ -706,17 +835,28 @@ impl NexusApp {
         if self.chat.is_streaming() {
             return;
         }
+        let session_id = if self.chat.new_session_draft {
+            None
+        } else {
+            self.active_session_id.clone()
+        };
         let req = TurnStreamRequest {
             project_root: self.root_opt(),
-            session_id: self.active_session_id.clone(),
+            session_id,
             harness: self.chat.harness().to_string(),
             model: self.chat.picker.selected.clone(),
             prompt: prompt.clone(),
             source: Some("desktop".into()),
             streaming: Some(true),
         };
-        match self.backend.submit(Request::StartTurn(req)) {
+        let auto_approve = if self.chat.new_session_draft || req.session_id.is_none() {
+            Some(self.chat.auto_approve)
+        } else {
+            None
+        };
+        match self.backend.submit(Request::StartTurn { req, auto_approve }) {
             Ok(seq) => {
+                self.chat.new_session_draft = false;
                 self.chat.timeline.begin_turn(&prompt);
                 self.chat.composer.clear();
                 self.chat.turn_seq = Some(seq);
@@ -742,6 +882,7 @@ impl NexusApp {
             // cancelled immediately; stream output is ignored meanwhile.
             None => self.chat.cancel_requested = true,
         }
+        self.chat.pending_permissions.clear();
         self.chat.timeline.end_turn(Some("turn cancelled"));
         self.set_status("cancel requested");
     }
@@ -891,7 +1032,7 @@ impl NexusApp {
             Reply::Sessions(r) => match r {
                 Ok(s) => {
                     self.sessions = s.sessions;
-                    if self.active_session_id.is_none() {
+                    if self.active_session_id.is_none() && !self.chat.new_session_draft {
                         self.active_session_id = s.active_session_id;
                     }
                 }
@@ -899,6 +1040,8 @@ impl NexusApp {
             },
             Reply::CreateSession(r) => match r {
                 Ok(c) if c.success => {
+                    self.chat.new_session_draft = false;
+                    self.chat.auto_approve = c.auto_approve.unwrap_or(self.chat.auto_approve);
                     self.active_session_id = Some(c.session_id.clone());
                     self.selected_session = None;
                     if !self.chat.is_streaming() {
@@ -1117,6 +1260,7 @@ impl NexusApp {
                         self.chat.timeline.end_turn(None);
                         self.chat.turn_seq = None;
                         self.chat.cancel_requested = false;
+                        self.chat.pending_permissions.clear();
                         self.set_status(format!("turn failed: {e}"));
                     }
                 }
@@ -1125,10 +1269,41 @@ impl NexusApp {
                 if self.chat.turn_seq != Some(seq) || self.chat.cancel_requested {
                     return;
                 }
+                if let StreamMessage::Event(ref evt) = msg {
+                    if self.active_session_id.is_none() {
+                        let asd_sid = evt
+                            .raw
+                            .as_ref()
+                            .and_then(|v| v.get("asdSessionId"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                            .or_else(|| {
+                                evt.session_id
+                                    .as_deref()
+                                    .filter(|id| id.starts_with("asd-"))
+                                    .map(str::to_string)
+                            });
+                        if let Some(sid) = asd_sid {
+                            self.active_session_id = Some(sid);
+                        }
+                    }
+                    if evt.kind == OrchestratorEventKind::PermissionRequest {
+                        if let Some(perm) = evt.permission_request.clone() {
+                            let tid = evt
+                                .turn_id
+                                .clone()
+                                .or_else(|| self.chat.timeline.turn_id.clone())
+                                .or_else(|| self.chat.handle.as_ref().and_then(|h| h.turn_id()))
+                                .unwrap_or_default();
+                            self.chat.pending_permissions.push_back((tid, perm));
+                        }
+                    }
+                }
                 self.chat.timeline.apply(&msg);
                 if !self.chat.timeline.streaming {
                     self.chat.turn_seq = None;
                     self.chat.handle = None;
+                    self.chat.pending_permissions.clear();
                     self.set_status(format!("turn done · {}", self.chat.timeline.turn_usage.readout()));
                     self.request(Request::Sessions { project_root: self.project_root.clone() });
                 }
@@ -1139,6 +1314,28 @@ impl NexusApp {
                     c.message.or(c.error).unwrap_or_else(|| c.success.to_string())
                 )),
                 Err(e) => self.set_status(format!("turn cancel: {e}")),
+            },
+            Reply::SetSessionAutoApprove(r) => match r {
+                Ok(resp) if resp.success => {
+                    if self.active_session_id.as_deref() == Some(resp.session_id.as_str()) {
+                        self.chat.auto_approve = resp.auto_approve;
+                    }
+                    self.set_status(format!(
+                        "auto-approve: {} ({})",
+                        if resp.auto_approve { "ON" } else { "OFF" },
+                        short_id(&resp.session_id)
+                    ));
+                }
+                Ok(resp) => self.set_status(format!("auto-approve: {}", resp.error.unwrap_or_default())),
+                Err(e) => self.set_status(format!("auto-approve: {e}")),
+            },
+            Reply::SubmitTurnPermission(r) => match r {
+                Ok(resp) if resp.success => self.set_status("permission decision submitted"),
+                Ok(resp) => self.set_status(format!(
+                    "permission decision: {}",
+                    resp.error.unwrap_or_else(|| "rejected".into())
+                )),
+                Err(e) => self.set_status(format!("permission decision: {e}")),
             },
         }
     }
@@ -1208,6 +1405,9 @@ impl NexusApp {
 
         if self.palette_open {
             self.command_palette_modal(ctx);
+        }
+        if !self.chat.pending_permissions.is_empty() {
+            self.permission_request_modal(ctx);
         }
     }
 
@@ -1443,7 +1643,7 @@ impl NexusApp {
             .on_hover_text("Start a new session in the active harness (/new)")
             .clicked()
         {
-            self.create_session();
+            self.start_new_session_draft();
             self.set_mode(PrimaryMode::Chat);
         }
 
@@ -1781,19 +1981,38 @@ impl NexusApp {
 
                         // Composer bottom internal toolbar
                         let streaming = self.chat.is_streaming();
+                        let session_started = self.is_session_started();
                         ui.horizontal(|ui| {
-                            // 1) [Harness ▾] dropdown pill
-                            let mut h_idx = self.chat.harness_idx;
-                            egui::ComboBox::from_id_salt("harness")
-                                .selected_text(RichText::new(self.chat.harness()).small().strong().color(p.text_hi))
-                                .width(126.0)
-                                .show_ui(ui, |ui| {
-                                    for (i, h) in HARNESSES.iter().enumerate() {
-                                        ui.selectable_value(&mut h_idx, i, *h);
-                                    }
-                                });
-                            if h_idx != self.chat.harness_idx {
-                                manual_harness_change = Some(h_idx);
+                            // 1) [Harness ▾] dropdown pill (new draft) OR read-only badge (started session)
+                            if !session_started {
+                                let mut h_idx = self.chat.harness_idx;
+                                egui::ComboBox::from_id_salt("harness")
+                                    .selected_text(RichText::new(self.chat.harness()).small().strong().color(p.text_hi))
+                                    .width(126.0)
+                                    .show_ui(ui, |ui| {
+                                        for (i, h) in HARNESSES.iter().enumerate() {
+                                            ui.selectable_value(&mut h_idx, i, *h);
+                                        }
+                                    });
+                                if h_idx != self.chat.harness_idx {
+                                    manual_harness_change = Some(h_idx);
+                                }
+                            } else {
+                                Frame::none()
+                                    .fill(p.panel)
+                                    .stroke(Stroke::new(1.0_f32, p.border))
+                                    .inner_margin(Margin::symmetric(8.0, 4.0))
+                                    .rounding(Rounding::same(p.pill_rounding))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(self.chat.harness())
+                                                .small()
+                                                .strong()
+                                                .color(p.text_hi),
+                                        );
+                                    })
+                                    .response
+                                    .on_hover_text("Harness is locked for started session. Click + New Chat (/new) to pick another harness.");
                             }
 
                             // 2) [Model ▾ (searchable)] dropdown pill + ↻ refresh
@@ -1860,6 +2079,26 @@ impl NexusApp {
                                 self.palette_open = true;
                                 self.palette_query.clear();
                                 self.palette_selected = 0;
+                            }
+
+                            // 4) Auto-Approve toggle pill (/auto-approve)
+                            let auto_label = if self.chat.auto_approve { "Auto: ON" } else { "Auto: OFF" };
+                            let auto_st = if self.chat.auto_approve {
+                                theme::status_badge_for(tm, "done")
+                            } else {
+                                theme::status_badge_for(tm, "review")
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new(auto_label).small().strong().color(auto_st.fg))
+                                        .fill(auto_st.bg)
+                                        .stroke(auto_st.stroke)
+                                        .rounding(Rounding::same(p.pill_rounding)),
+                                )
+                                .on_hover_text("Toggle auto-approve tool permissions (/auto-approve)")
+                                .clicked()
+                            {
+                                self.set_auto_approve(!self.chat.auto_approve);
                             }
 
                             // 4) Right-aligned [Send] / [Stop] pill button
@@ -1940,13 +2179,15 @@ impl NexusApp {
                 action: PaletteAction::SwitchDashboardTab(t),
             });
         }
-        for (i, h) in HARNESSES.iter().enumerate() {
-            entries.push(PaletteEntry {
-                category: "Harness",
-                label: format!("Harness: {h}"),
-                detail: "Switch active harness and open a new session".into(),
-                action: PaletteAction::SwitchHarness(i),
-            });
+        if !self.is_session_started() {
+            for (i, h) in HARNESSES.iter().enumerate() {
+                entries.push(PaletteEntry {
+                    category: "Harness",
+                    label: format!("Harness: {h}"),
+                    detail: "Switch active harness for new session".into(),
+                    action: PaletteAction::SwitchHarness(i),
+                });
+            }
         }
         for p in &self.projects {
             entries.push(PaletteEntry {
@@ -1971,6 +2212,9 @@ impl NexusApp {
             });
         }
         for (h_idx, h) in HARNESSES.iter().enumerate() {
+            if self.is_session_started() && h_idx != self.chat.harness_idx {
+                continue;
+            }
             if let Some(models) = self.chat.picker.models.get(*h) {
                 for m in models {
                     entries.push(PaletteEntry {
@@ -1982,7 +2226,12 @@ impl NexusApp {
                 }
             }
         }
-        for item in build_slash_items("", self.chat.harness(), &self.chat.harness_commands) {
+        for item in build_slash_items(
+            "",
+            self.chat.harness(),
+            &self.chat.harness_commands,
+            !self.is_session_started(),
+        ) {
             entries.push(PaletteEntry {
                 category: "Command",
                 label: format!("/{}", item.name),
@@ -2020,6 +2269,10 @@ impl NexusApp {
             PaletteAction::SwitchHarness(idx) => self.change_harness_manually(idx),
             PaletteAction::SelectModel(h_idx, model) => {
                 if h_idx != self.chat.harness_idx {
+                    if self.is_session_started() {
+                        self.set_status("harness is locked for started session; click + New Chat (/new) first");
+                        return;
+                    }
                     self.change_harness_manually(h_idx);
                 }
                 self.chat.picker.selected = model;
@@ -2097,6 +2350,178 @@ impl NexusApp {
         }
         if let Some(act) = chosen {
             self.execute_palette_action(act, Some(ctx));
+        }
+    }
+
+    fn permission_request_modal(&mut self, ctx: &egui::Context) {
+        let Some((turn_id, perm)) = self.chat.pending_permissions.front().cloned() else {
+            return;
+        };
+        let queue_len = self.chat.pending_permissions.len();
+        let p = theme::palette(self.theme_mode);
+        let tm = self.theme_mode;
+        let mut decision: Option<(&'static str, Option<String>)> = None;
+
+        egui::Window::new("Permission Request")
+            .id(egui::Id::new("permission-request-modal"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(520.0)
+            .max_width(560.0)
+            .frame(
+                Frame::none()
+                    .fill(p.panel)
+                    .stroke(Stroke::new(1.5_f32, p.border_hi))
+                    .inner_margin(Margin::same(14.0))
+                    .rounding(Rounding::same(p.card_rounding)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    badge(ui, "PERMISSION", theme::status_badge_for(tm, "review"));
+                    if queue_len > 1 {
+                        ui.label(
+                            RichText::new(format!("1 of {queue_len} pending"))
+                                .small()
+                                .color(p.dim),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !turn_id.is_empty() {
+                            ui.label(
+                                RichText::new(short_id(&turn_id))
+                                    .small()
+                                    .monospace()
+                                    .color(p.muted),
+                            );
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Tool:").small().strong().color(p.dim));
+                    ui.label(RichText::new(&perm.tool_name).monospace().strong().color(p.white));
+                    if let Some(kind) = &perm.tool_kind {
+                        ui.label(RichText::new(format!("({kind})")).small().color(p.muted));
+                    }
+                });
+
+                if let Some(locs) = perm.locations.as_ref().filter(|v| !v.is_empty()) {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Paths:").small().strong().color(p.dim));
+                        ui.label(RichText::new(locs.join(", ")).monospace().small().color(p.text_hi));
+                    });
+                }
+
+                if let Some(input) = perm.tool_input.as_ref().filter(|s| !s.trim().is_empty()) {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Input:").small().strong().color(p.dim));
+                    Frame::none()
+                        .fill(p.code_bg)
+                        .stroke(Stroke::new(1.0_f32, p.border))
+                        .inner_margin(Margin::same(8.0))
+                        .rounding(Rounding::same(6.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ScrollArea::vertical()
+                                .id_salt("perm-input-scroll")
+                                .max_height(180.0)
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new(input).monospace().small().color(p.text));
+                                });
+                        });
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    if perm.options.is_empty() {
+                        let allow_st = theme::status_badge_for(tm, "done");
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Allow Once").strong().color(allow_st.fg))
+                                    .fill(allow_st.bg)
+                                    .stroke(allow_st.stroke)
+                                    .rounding(Rounding::same(p.pill_rounding)),
+                            )
+                            .clicked()
+                        {
+                            decision = Some(("selected", Some("allow_once".into())));
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Allow Always").strong().color(p.white))
+                                    .fill(p.accent_fill)
+                                    .rounding(Rounding::same(p.pill_rounding)),
+                            )
+                            .clicked()
+                        {
+                            decision = Some(("selected", Some("allow_always".into())));
+                        }
+                        let rej_st = theme::status_badge_for(tm, "failed");
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Reject").strong().color(rej_st.fg))
+                                    .fill(rej_st.bg)
+                                    .stroke(rej_st.stroke)
+                                    .rounding(Rounding::same(p.pill_rounding)),
+                            )
+                            .clicked()
+                        {
+                            decision = Some(("cancelled", None));
+                        }
+                    } else {
+                        let has_reject = perm.options.iter().any(|o| o.kind.starts_with("reject"));
+                        for opt in &perm.options {
+                            let btn = match opt.kind.as_str() {
+                                "allow_always" => egui::Button::new(
+                                    RichText::new(&opt.name).strong().color(p.white),
+                                )
+                                .fill(p.accent_fill)
+                                .rounding(Rounding::same(p.pill_rounding)),
+                                k if k.starts_with("reject") => {
+                                    let st = theme::status_badge_for(tm, "failed");
+                                    egui::Button::new(RichText::new(&opt.name).strong().color(st.fg))
+                                        .fill(st.bg)
+                                        .stroke(st.stroke)
+                                        .rounding(Rounding::same(p.pill_rounding))
+                                }
+                                _ => {
+                                    let st = theme::status_badge_for(tm, "done");
+                                    egui::Button::new(RichText::new(&opt.name).strong().color(st.fg))
+                                        .fill(st.bg)
+                                        .stroke(st.stroke)
+                                        .rounding(Rounding::same(p.pill_rounding))
+                                }
+                            };
+                            if ui.add(btn).clicked() {
+                                decision = Some(("selected", Some(opt.option_id.clone())));
+                            }
+                        }
+                        if !has_reject {
+                            let rej_st = theme::status_badge_for(tm, "failed");
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("Reject").strong().color(rej_st.fg))
+                                        .fill(rej_st.bg)
+                                        .stroke(rej_st.stroke)
+                                        .rounding(Rounding::same(p.pill_rounding)),
+                                )
+                                .clicked()
+                            {
+                                decision = Some(("cancelled", None));
+                            }
+                        }
+                    }
+                });
+            });
+
+        if let Some((outcome, option_id)) = decision {
+            self.respond_to_permission(outcome, option_id);
         }
     }
 

@@ -38,8 +38,10 @@ pub enum Request {
     ResumeCommand { session_id: String, project_root: Option<String> },
     TerminalOpen { req: TerminalOpenRequest, kind: Option<TerminalKind> },
     LaunchLocal { spec: TerminalOpenResponse, kind: Option<TerminalKind> },
-    StartTurn(TurnStreamRequest),
+    StartTurn { req: TurnStreamRequest, auto_approve: Option<bool> },
     CancelTurn(TurnStreamHandle),
+    SetSessionAutoApprove(SetSessionAutoApproveRequest),
+    SubmitTurnPermission(TurnPermissionDecisionRequest),
 }
 
 impl Request {
@@ -72,8 +74,10 @@ impl Request {
             Request::ResumeCommand { .. } => "resume command",
             Request::TerminalOpen { .. } => "terminal open",
             Request::LaunchLocal { .. } => "launch terminal",
-            Request::StartTurn(_) => "turn",
+            Request::StartTurn { .. } => "turn",
             Request::CancelTurn(_) => "cancel turn",
+            Request::SetSessionAutoApprove(_) => "set auto-approve",
+            Request::SubmitTurnPermission(_) => "submit turn permission",
         }
     }
 }
@@ -121,6 +125,8 @@ pub enum Reply {
     TurnStarted { seq: u64, handle: R<TurnStreamHandle> },
     Stream { seq: u64, msg: StreamMessage },
     TurnCancelled(R<TurnCancelResponse>),
+    SetSessionAutoApprove(R<SetSessionAutoApproveResponse>),
+    SubmitTurnPermission(R<TurnPermissionDecisionResponse>),
 }
 
 fn e<T>(r: asd_nexus_client::Result<T>) -> R<T> {
@@ -218,25 +224,52 @@ pub fn execute(c: &NexusClient, req: Request, tx: &Sender<Reply>, seq: u64) -> O
             Ok(spec) => launch(&spec, kind),
         }),
         Request::LaunchLocal { spec, kind } => Reply::Terminal(launch(&spec, kind)),
-        Request::StartTurn(r) => match c.stream_turn(&r) {
-            Err(err) => Reply::TurnStarted { seq, handle: Err(err.to_string()) },
-            Ok((handle, rx)) => {
-                if tx.send(Reply::TurnStarted { seq, handle: Ok(handle) }).is_err() {
-                    return None;
+        Request::StartTurn { mut req, auto_approve } => {
+            if req.session_id.is_none() && auto_approve == Some(false) {
+                match c.create_session(&CreateSessionRequest {
+                    project_root: req.project_root.clone(),
+                    harness: Some(req.harness.clone()),
+                    model: req.model.clone(),
+                    title: None,
+                    memo: None,
+                    make_foreground: Some(true),
+                    auto_approve: Some(false),
+                }) {
+                    Ok(created) if created.success => {
+                        req.session_id = Some(created.session_id.clone());
+                        let _ = tx.send(Reply::CreateSession(Ok(created)));
+                    }
+                    Ok(created) => {
+                        let msg = created.error.unwrap_or_else(|| "create session failed".into());
+                        return Some(Reply::TurnStarted { seq, handle: Err(msg) });
+                    }
+                    Err(err) => {
+                        return Some(Reply::TurnStarted { seq, handle: Err(err.to_string()) });
+                    }
                 }
-                for msg in rx {
-                    let done = msg == StreamMessage::Done;
-                    if tx.send(Reply::Stream { seq, msg }).is_err() {
+            }
+            match c.stream_turn(&req) {
+                Err(err) => Reply::TurnStarted { seq, handle: Err(err.to_string()) },
+                Ok((handle, rx)) => {
+                    if tx.send(Reply::TurnStarted { seq, handle: Ok(handle) }).is_err() {
                         return None;
                     }
-                    if done {
-                        break;
+                    for msg in rx {
+                        let done = msg == StreamMessage::Done;
+                        if tx.send(Reply::Stream { seq, msg }).is_err() {
+                            return None;
+                        }
+                        if done {
+                            break;
+                        }
                     }
+                    return None;
                 }
-                return None;
             }
-        },
+        }
         Request::CancelTurn(h) => Reply::TurnCancelled(e(h.cancel())),
+        Request::SetSessionAutoApprove(r) => Reply::SetSessionAutoApprove(e(c.set_session_auto_approve(&r))),
+        Request::SubmitTurnPermission(r) => Reply::SubmitTurnPermission(e(c.submit_turn_permission(&r))),
     })
 }
 
@@ -308,7 +341,7 @@ impl Backend {
         let seq = self.seq;
         let tx = self.tx.clone();
         let repaint = self.repaint.clone();
-        let streaming = matches!(req, Request::StartTurn(_));
+        let streaming = matches!(req, Request::StartTurn { .. });
         if !streaming {
             self.in_flight += 1;
         }
