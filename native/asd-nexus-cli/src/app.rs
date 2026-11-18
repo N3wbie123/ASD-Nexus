@@ -5,6 +5,7 @@
 //! interaction path deterministically testable without a live server.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -139,6 +140,8 @@ pub enum Action {
     SaveMemo { session_id: String, memo: String },
     SetForeground(String),
     SetPhase { session_id: String, phase: SessionPhase },
+    SetAutoApprove(bool),
+    RespondPermission { turn_id: String, request_id: String, outcome: String, option_id: Option<String> },
     RefreshModels { force: bool },
     RefreshHarnessCommands,
     ListFiles { prefix: Option<String> },
@@ -173,9 +176,10 @@ const BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[
     ("sessions", "/sessions", "Open session explorer modal (alias: /s)"),
     ("s", "/s", "Open session explorer modal"),
     ("cd", "/cd [path]", "Switch project directory or open directory picker"),
-    ("new", "/new [title]", "Create and open a new session in current harness"),
+    ("new", "/new [title]", "Start a new session draft (or create with title)"),
     ("models", "/models", "Open harness & model picker modal (Ctrl+K)"),
-    ("harness", "/harness [name]", "Switch active harness (Tab)"),
+    ("harness", "/harness [name]", "Switch active harness (Tab, new session only)"),
+    ("auto-approve", "/auto-approve [on|off]", "Toggle or set tool auto-approve mode"),
     ("board", "/board", "Open ASD progress board & PLAN.md (Ctrl+B)"),
     ("diff", "/diff", "Open worktree diff & review modal (Ctrl+D)"),
     ("subagents", "/subagents", "Open subagents & live log tail modal (Ctrl+L)"),
@@ -218,6 +222,10 @@ pub struct App {
     pub harness_filter: Option<usize>,
     pub current: Option<DiscoveredSessionItem>,
     pub current_asd: Option<String>,
+    pub new_session_draft: bool,
+    pub auto_approve: bool,
+    pub pending_permissions: VecDeque<(String, PermissionRequestPayload)>,
+    pub permission_sel: usize,
 
     pub models: std::collections::HashMap<String, Vec<String>>,
     pub picker_harness: usize,
@@ -320,6 +328,10 @@ impl App {
             harness_filter: None,
             current: None,
             current_asd: None,
+            new_session_draft: true,
+            auto_approve: true,
+            pending_permissions: VecDeque::new(),
+            permission_sel: 0,
             models: Default::default(),
             picker_harness,
             picker_query: String::new(),
@@ -395,36 +407,79 @@ impl App {
         self.stream.is_some() || self.timeline.streaming
     }
 
+    pub fn is_session_started(&self) -> bool {
+        !self.new_session_draft
+            || self.current.is_some()
+            || self.current_asd.is_some()
+            || self.cli_session.is_some()
+            || !self.timeline.entries.is_empty()
+            || self.is_streaming()
+    }
+
+    pub fn start_new_session_draft(&mut self) {
+        self.current = None;
+        self.current_asd = None;
+        self.cli_session = None;
+        self.new_session_draft = true;
+        self.timeline.clear();
+        self.timeline_sel = 0;
+        self.timeline_scroll = None;
+        self.resume = None;
+        self.pending_permissions.clear();
+        self.permission_sel = 0;
+        self.set_status("New session — choose harness & model, then send a prompt");
+    }
+
+    pub fn set_auto_approve(&mut self, enabled: bool) {
+        self.auto_approve = enabled;
+        if self.active_session_id().is_some() {
+            self.push(Action::SetAutoApprove(enabled));
+        }
+        self.set_status(format!(
+            "Auto-approve: {}",
+            if enabled { "ON" } else { "OFF (manual tool approval)" }
+        ));
+    }
+
     /// ASD session used for board / subagents / turns.
     pub fn active_session_id(&self) -> Option<String> {
-        self.current_asd
-            .clone()
-            .or_else(|| self.cli_session.clone())
-            .or_else(|| self.foreground_id.clone())
+        if let Some(id) = self.current_asd.clone().or_else(|| self.cli_session.clone()) {
+            return Some(id);
+        }
+        if self.new_session_draft {
+            return None;
+        }
+        self.foreground_id.clone()
     }
 
     // --------------------------------------------------------- harness switch
 
     /// Switch harness manually (`Tab`, `/harness`, `/models`).
-    /// When the harness actually changes, clears the current session/timeline,
-    /// queues `CreateSession` for the new harness, and refreshes harness commands.
+    /// Allowed only on an unstarted New Session draft; locked once a session is started.
     pub fn switch_harness(&mut self, new_harness: &str, new_model: Option<String>) {
         let changed = self.harness != new_harness;
+        if self.is_session_started() {
+            if changed {
+                self.set_status("Harness is locked for started session; run /new to pick another harness");
+                return;
+            }
+            self.model = new_model;
+            self.picker_harness = HARNESSES.iter().position(|h| *h == self.harness).unwrap_or(0);
+            self.set_status(format!(
+                "Harness {} · model {}",
+                self.harness,
+                self.model.as_deref().unwrap_or("(default)")
+            ));
+            return;
+        }
         self.harness = new_harness.to_string();
         self.model = new_model;
         self.picker_harness = HARNESSES.iter().position(|h| *h == self.harness).unwrap_or(0);
         if changed {
-            self.current = None;
-            self.current_asd = None;
-            self.timeline.clear();
-            self.timeline_sel = 0;
-            self.timeline_scroll = None;
-            self.resume = None;
             self.harness_commands.clear();
-            self.push(Action::CreateSession { title: None });
             self.push(Action::RefreshHarnessCommands);
             self.set_status(format!(
-                "Switched to {} · new session · model {}",
+                "Selected {} · model {} (new session)",
                 self.harness,
                 self.model.as_deref().unwrap_or("(default)")
             ));
@@ -499,8 +554,10 @@ impl App {
     // ------------------------------------------------ slash & command palette
 
     pub fn all_slash_commands(&self) -> Vec<SlashCommandEntry> {
+        let started = self.is_session_started();
         let mut out: Vec<SlashCommandEntry> = BUILTIN_COMMANDS
             .iter()
+            .filter(|(name, _, _)| !(started && *name == "harness"))
             .map(|(name, usage, desc)| SlashCommandEntry {
                 name: (*name).to_string(),
                 usage: (*usage).to_string(),
@@ -534,7 +591,12 @@ impl App {
     }
 
     fn current_slash_query(&self) -> Option<String> {
-        if self.popup_dismissed || self.overlay.is_some() || self.prompt.is_some() || self.confirm.is_some() {
+        if self.popup_dismissed
+            || !self.pending_permissions.is_empty()
+            || self.overlay.is_some()
+            || self.prompt.is_some()
+            || self.confirm.is_some()
+        {
             return None;
         }
         if self.input_area.lines.len() != 1 {
@@ -582,15 +644,17 @@ impl App {
     pub fn palette_items(&self) -> Vec<SlashCommandEntry> {
         let mut all = self.all_slash_commands();
         all.retain(|c| c.name != "s" && c.name != "quit");
-        for h in HARNESSES {
-            all.push(SlashCommandEntry {
-                name: format!("harness {h}"),
-                usage: format!("/harness {h}"),
-                description: format!("Switch active harness to {h} (opens new session)"),
-                badge: CommandBadge::Nexus,
-                is_builtin: true,
-                kind_label: "harness",
-            });
+        if !self.is_session_started() {
+            for h in HARNESSES {
+                all.push(SlashCommandEntry {
+                    name: format!("harness {h}"),
+                    usage: format!("/harness {h}"),
+                    description: format!("Switch active harness to {h} (new session)"),
+                    badge: CommandBadge::Nexus,
+                    is_builtin: true,
+                    kind_label: "harness",
+                });
+            }
         }
         let q = self.palette_query.trim().to_lowercase();
         if q.is_empty() {
@@ -609,6 +673,7 @@ impl App {
 
     pub fn is_file_popup_active(&self) -> bool {
         self.file_popup_open
+            && self.pending_permissions.is_empty()
             && self.overlay.is_none()
             && self.prompt.is_none()
             && self.confirm.is_none()
@@ -739,6 +804,27 @@ impl App {
             }
         }
         for m in &msgs {
+            if let StreamMessage::Event(evt) = m {
+                if self.current_asd.is_none() {
+                    if let Some(sid) = evt.session_id.as_deref() {
+                        if sid.starts_with("asd-") {
+                            self.current_asd = Some(sid.to_string());
+                            self.new_session_draft = false;
+                        }
+                    }
+                }
+                if evt.kind == OrchestratorEventKind::PermissionRequest {
+                    if let Some(perm) = evt.permission_request.clone() {
+                        let tid = evt
+                            .turn_id
+                            .clone()
+                            .or_else(|| self.timeline.turn_id.clone())
+                            .unwrap_or_default();
+                        self.pending_permissions.push_back((tid, perm));
+                        self.permission_sel = 0;
+                    }
+                }
+            }
             self.timeline.apply(m);
         }
         if !msgs.is_empty() {
@@ -748,6 +834,8 @@ impl App {
         if closed || !self.timeline.streaming {
             self.timeline.end_turn(Some("stream closed"));
             self.stream = None;
+            self.pending_permissions.clear();
+            self.permission_sel = 0;
             self.set_status("Turn finished");
         }
     }
@@ -832,6 +920,17 @@ impl App {
     // -------------------------------------------------------------- key input
 
     pub fn handle_key(&mut self, k: KeyEvent) {
+        if !self.pending_permissions.is_empty() {
+            if ctrl(&k, 'c') || ctrl(&k, 'q') {
+                if self.is_streaming() {
+                    self.push(Action::CancelTurn);
+                }
+                self.should_quit = true;
+                return;
+            }
+            self.handle_permission_key(k);
+            return;
+        }
         if let Some((_, action)) = self.confirm.take() {
             if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 self.push(action);
@@ -900,6 +999,10 @@ impl App {
                 return;
             }
             if self.focus == Focus::Input && !self.sidebar_open {
+                if self.is_session_started() {
+                    self.set_status("Harness is locked for started session; run /new to pick another harness");
+                    return;
+                }
                 let i = HARNESSES.iter().position(|h| *h == self.harness).unwrap_or(0);
                 let next = if k.code == KeyCode::Tab {
                     (i + 1) % HARNESSES.len()
@@ -927,7 +1030,7 @@ impl App {
     // ------------------------------------------------------------- mouse input
 
     pub fn handle_mouse(&mut self, m: MouseEvent) {
-        if self.confirm.is_some() || self.prompt.is_some() {
+        if !self.pending_permissions.is_empty() || self.confirm.is_some() || self.prompt.is_some() {
             return;
         }
         match m.kind {
@@ -1096,7 +1199,10 @@ impl App {
                 let opt = (!text.is_empty()).then(|| text.clone());
                 match p.purpose {
                     PromptPurpose::Search => self.search = text,
-                    PromptPurpose::NewSessionTitle => self.push(Action::CreateSession { title: opt }),
+                    PromptPurpose::NewSessionTitle => {
+                        self.new_session_draft = false;
+                        self.push(Action::CreateSession { title: opt });
+                    }
                     PromptPurpose::Memo { session_id } => {
                         self.push(Action::SaveMemo { session_id, memo: p.buffer })
                     }
@@ -1169,6 +1275,10 @@ impl App {
                     if s.model.is_some() {
                         self.model = s.model.clone();
                     }
+                    self.auto_approve = s.auto_approve.unwrap_or(true);
+                    self.new_session_draft = false;
+                    self.current_asd = s.asd_session_id.clone();
+                    self.current = Some(s.clone());
                     self.picker_harness = HARNESSES.iter().position(|h| *h == self.harness).unwrap_or(0);
                     if self.overlay == Some(Overlay::Sessions) {
                         self.overlay = None;
@@ -1492,6 +1602,7 @@ impl App {
             return;
         }
         self.clear_input();
+        self.new_session_draft = false;
         self.push(Action::SendPrompt(text));
     }
 
@@ -1514,6 +1625,10 @@ impl App {
 
         // Handle `/harness <name>` entries from CommandPalette (`"harness codex"`)
         if let Some(h_arg) = resolved_cmd.strip_prefix("harness ") {
+            if self.is_session_started() {
+                self.set_status("Harness is locked for started session; run /new first");
+                return;
+            }
             let h_arg = h_arg.trim();
             if HARNESSES.contains(&h_arg) {
                 self.switch_harness(h_arg, None);
@@ -1534,17 +1649,30 @@ impl App {
                 self.open_overlay(Overlay::Sessions);
             }
             "new" => {
-                self.current = None;
-                self.current_asd = None;
-                self.timeline.clear();
-                self.timeline_sel = 0;
-                self.timeline_scroll = None;
-                self.push(Action::CreateSession { title: arg.map(str::to_string) });
+                if let Some(title) = arg {
+                    self.current = None;
+                    self.current_asd = None;
+                    self.cli_session = None;
+                    self.new_session_draft = false;
+                    self.timeline.clear();
+                    self.timeline_sel = 0;
+                    self.timeline_scroll = None;
+                    self.resume = None;
+                    self.pending_permissions.clear();
+                    self.permission_sel = 0;
+                    self.push(Action::CreateSession { title: Some(title.to_string()) });
+                } else {
+                    self.start_new_session_draft();
+                }
             }
             "models" => {
                 self.open_overlay(Overlay::ModelPicker);
             }
             "harness" => {
+                if self.is_session_started() {
+                    self.set_status("Harness is locked for started session; run /new first");
+                    return;
+                }
                 if let Some(name) = arg {
                     if let Some(&h) = HARNESSES.iter().find(|&&h| h.eq_ignore_ascii_case(name)) {
                         self.switch_harness(h, None);
@@ -1557,6 +1685,12 @@ impl App {
                     self.switch_harness(next, None);
                 }
             }
+            "auto-approve" => match arg.map(|s| s.to_lowercase()).as_deref() {
+                Some("on" | "true" | "1") => self.set_auto_approve(true),
+                Some("off" | "false" | "0") => self.set_auto_approve(false),
+                None => self.set_auto_approve(!self.auto_approve),
+                Some(other) => self.set_status(format!("Usage: /auto-approve [on|off] (got '{other}')")),
+            },
             "board" => self.open_overlay(Overlay::Board),
             "diff" => self.open_overlay(Overlay::Diff),
             "subagents" => self.open_overlay(Overlay::Subagents),
@@ -1596,6 +1730,7 @@ impl App {
                 } else {
                     format!("/{resolved_cmd}")
                 };
+                self.new_session_draft = false;
                 self.push(Action::SendPrompt(prompt));
             }
         }
@@ -1628,16 +1763,24 @@ impl App {
 
     fn handle_picker_key(&mut self, k: KeyEvent) {
         let n = self.picker_models().len();
+        let locked = self.is_session_started();
+        if locked {
+            self.picker_harness = HARNESSES.iter().position(|h| *h == self.harness).unwrap_or(0);
+        }
         match k.code {
             KeyCode::Up => self.picker_sel = self.picker_sel.saturating_sub(1),
             KeyCode::Down => self.picker_sel = (self.picker_sel + 1).min(n.saturating_sub(1)),
             KeyCode::Tab | KeyCode::Right => {
-                self.picker_harness = (self.picker_harness + 1) % HARNESSES.len();
-                self.picker_sel = 0;
+                if !locked {
+                    self.picker_harness = (self.picker_harness + 1) % HARNESSES.len();
+                    self.picker_sel = 0;
+                }
             }
             KeyCode::BackTab | KeyCode::Left => {
-                self.picker_harness = (self.picker_harness + HARNESSES.len() - 1) % HARNESSES.len();
-                self.picker_sel = 0;
+                if !locked {
+                    self.picker_harness = (self.picker_harness + HARNESSES.len() - 1) % HARNESSES.len();
+                    self.picker_sel = 0;
+                }
             }
             KeyCode::F(5) => self.push(Action::RefreshModels { force: true }),
             KeyCode::Backspace => {
@@ -1650,10 +1793,124 @@ impl App {
             }
             KeyCode::Enter => {
                 let models = self.picker_models();
-                let new_harness = HARNESSES[self.picker_harness].to_string();
+                let new_harness = if locked {
+                    self.harness.clone()
+                } else {
+                    HARNESSES[self.picker_harness].to_string()
+                };
                 let new_model = models.get(self.picker_sel).filter(|_| self.picker_sel > 0).cloned();
                 self.overlay = None;
                 self.switch_harness(&new_harness, new_model);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_permission_key(&mut self, k: KeyEvent) {
+        let Some((turn_id, perm)) = self.pending_permissions.front().cloned() else {
+            return;
+        };
+        let option_count = if perm.options.is_empty() { 2 } else { perm.options.len() };
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.permission_sel = self.permission_sel.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.permission_sel = (self.permission_sel + 1).min(option_count.saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let (outcome, option_id, is_always) = if !perm.options.is_empty() {
+                    let opt = perm
+                        .options
+                        .get(self.permission_sel)
+                        .or_else(|| perm.options.first())
+                        .cloned()
+                        .unwrap();
+                    let always = opt.kind == "allow_always" || opt.option_id == "allow_always";
+                    ("selected".to_string(), Some(opt.option_id), always)
+                } else if self.permission_sel == 0 {
+                    ("selected".to_string(), Some("allow_once".to_string()), false)
+                } else {
+                    ("cancelled".to_string(), None, false)
+                };
+                if is_always {
+                    self.auto_approve = true;
+                }
+                self.pending_permissions.pop_front();
+                self.permission_sel = 0;
+                self.push(Action::RespondPermission {
+                    turn_id,
+                    request_id: perm.request_id,
+                    outcome,
+                    option_id,
+                });
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let opt_id = perm
+                    .options
+                    .iter()
+                    .find(|o| o.kind == "allow_once" || o.option_id == "allow_once")
+                    .or_else(|| {
+                        perm.options
+                            .iter()
+                            .find(|o| o.kind.starts_with("allow") || o.option_id.contains("allow"))
+                    })
+                    .map(|o| o.option_id.clone())
+                    .or_else(|| perm.options.first().map(|o| o.option_id.clone()))
+                    .unwrap_or_else(|| "allow_once".to_string());
+                self.pending_permissions.pop_front();
+                self.permission_sel = 0;
+                self.push(Action::RespondPermission {
+                    turn_id,
+                    request_id: perm.request_id,
+                    outcome: "selected".to_string(),
+                    option_id: Some(opt_id),
+                });
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                let opt_id = perm
+                    .options
+                    .iter()
+                    .find(|o| o.kind == "allow_always" || o.option_id == "allow_always")
+                    .or_else(|| {
+                        perm.options
+                            .iter()
+                            .find(|o| o.kind.starts_with("allow") || o.option_id.contains("allow"))
+                    })
+                    .map(|o| o.option_id.clone())
+                    .unwrap_or_else(|| "allow_always".to_string());
+                self.auto_approve = true;
+                self.pending_permissions.pop_front();
+                self.permission_sel = 0;
+                self.push(Action::RespondPermission {
+                    turn_id,
+                    request_id: perm.request_id,
+                    outcome: "selected".to_string(),
+                    option_id: Some(opt_id),
+                });
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                let opt = perm
+                    .options
+                    .iter()
+                    .find(|o| o.kind == "reject_once" || o.option_id == "reject_once")
+                    .or_else(|| {
+                        perm.options
+                            .iter()
+                            .find(|o| o.kind.starts_with("reject") || o.option_id.contains("reject"))
+                    });
+                let (outcome, option_id) = match opt {
+                    Some(o) => ("selected".to_string(), Some(o.option_id.clone())),
+                    None => ("cancelled".to_string(), None),
+                };
+                self.pending_permissions.pop_front();
+                self.permission_sel = 0;
+                self.push(Action::RespondPermission {
+                    turn_id,
+                    request_id: perm.request_id,
+                    outcome,
+                    option_id,
+                });
             }
             _ => {}
         }

@@ -194,6 +194,14 @@ impl Timeline {
                         self.push(Entry::new(EntryKind::Error, m));
                     }
                     OrchestratorEventKind::Status => {}
+                    OrchestratorEventKind::PermissionRequest => {
+                        if let Some(p) = &evt.permission_request {
+                            self.push(Entry::new(
+                                EntryKind::System,
+                                format!("permission requested: {}", p.tool_name),
+                            ));
+                        }
+                    }
                 }
                 if let Some(u) = &evt.usage {
                     if evt.kind != OrchestratorEventKind::Usage {

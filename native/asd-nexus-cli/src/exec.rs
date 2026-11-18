@@ -71,6 +71,10 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
                     app.project_root = r.project_root;
                     app.current = None;
                     app.current_asd = None;
+                    app.cli_session = None;
+                    app.new_session_draft = true;
+                    app.pending_permissions.clear();
+                    app.permission_sel = 0;
                     app.timeline.clear();
                     app.timeline_sel = 0;
                     app.timeline_scroll = None;
@@ -108,6 +112,10 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
                 app.model = s.model.clone();
             }
             app.current_asd = s.asd_session_id.clone();
+            app.auto_approve = s.auto_approve.unwrap_or(true);
+            app.new_session_draft = false;
+            app.pending_permissions.clear();
+            app.permission_sel = 0;
             app.current = Some(*s);
             app.timeline_sel = 0;
             app.timeline_scroll = None;
@@ -131,11 +139,16 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
                 title,
                 memo: None,
                 make_foreground: Some(true),
+                auto_approve: Some(app.auto_approve),
             };
             if let Some(r) = try_(app, "create session", client.create_session(&req)) {
                 if outcome(app, "create session", r.success, r.error) {
                     app.current_asd = Some(r.session_id.clone());
                     app.current = None;
+                    app.new_session_draft = false;
+                    app.auto_approve = r.auto_approve.unwrap_or(app.auto_approve);
+                    app.pending_permissions.clear();
+                    app.permission_sel = 0;
                     app.timeline.clear();
                     app.timeline_sel = 0;
                     app.timeline_scroll = None;
@@ -222,6 +235,35 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
                 }
             }
         }
+        Action::SetAutoApprove(enabled) => {
+            if let Some(sid) = app.active_session_id() {
+                let req = SetSessionAutoApproveRequest {
+                    project_root: root(app),
+                    session_id: sid,
+                    auto_approve: enabled,
+                };
+                if let Some(r) = try_(app, "auto-approve", client.set_session_auto_approve(&req)) {
+                    if outcome(app, "auto-approve", r.success, r.error) {
+                        app.auto_approve = r.auto_approve;
+                        app.set_status(format!(
+                            "Auto-approve: {}",
+                            if r.auto_approve { "ON" } else { "OFF" }
+                        ));
+                    }
+                }
+            }
+        }
+        Action::RespondPermission { turn_id, request_id, outcome: decision_outcome, option_id } => {
+            let req = TurnPermissionDecisionRequest {
+                turn_id,
+                request_id,
+                outcome: decision_outcome,
+                option_id,
+            };
+            if let Some(r) = try_(app, "permission", client.submit_turn_permission(&req)) {
+                outcome(app, "permission", r.success, r.error);
+            }
+        }
         Action::RefreshModels { force } => {
             let r = if force {
                 client.refresh_models()
@@ -274,9 +316,28 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
             app.execute_shell(&cmd);
         }
         Action::SendPrompt(prompt) => {
+            app.new_session_draft = false;
+            let mut session_id = app.current_asd.clone().or_else(|| app.cli_session.clone());
+            if session_id.is_none() && !app.auto_approve {
+                let create_req = CreateSessionRequest {
+                    project_root: root(app),
+                    harness: Some(app.harness.clone()),
+                    model: app.model.clone(),
+                    make_foreground: Some(true),
+                    auto_approve: Some(false),
+                    ..Default::default()
+                };
+                if let Some(r) = try_(app, "create session", client.create_session(&create_req)) {
+                    if r.success {
+                        app.current_asd = Some(r.session_id.clone());
+                        app.auto_approve = r.auto_approve.unwrap_or(false);
+                        session_id = Some(r.session_id);
+                    }
+                }
+            }
             let req = TurnStreamRequest {
                 project_root: root(app),
-                session_id: app.current_asd.clone().or_else(|| app.cli_session.clone()),
+                session_id,
                 harness: app.harness.clone(),
                 model: app.model.clone(),
                 prompt: prompt.clone(),

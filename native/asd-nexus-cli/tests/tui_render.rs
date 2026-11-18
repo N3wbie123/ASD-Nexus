@@ -73,6 +73,7 @@ fn session(h: &str, id: &str, asd: Option<&str>, phase: Option<&str>) -> Discove
         asd_session_id: asd.map(Into::into),
         asd_phase: phase.map(Into::into),
         is_promoted_to_asd: asd.is_some(),
+        auto_approve: None,
     }
 }
 
@@ -367,35 +368,27 @@ fn multiline_textarea_and_mouse_scroll_and_click() {
 }
 
 #[test]
-fn harness_switch_creates_new_session_but_open_session_does_not() {
+fn harness_selection_allowed_in_draft_and_locked_after_session_started() {
     let mut a = app();
-    a.current = Some(session("claude-code", "cc-1", Some("asd-1"), Some("running")));
-    a.current_asd = Some("asd-1".into());
-    a.timeline.push(Entry::new(EntryKind::User, "old message"));
+    // Startup is a New Session draft: active_session_id does NOT fall back to foreground_id.
+    assert!(a.new_session_draft);
+    assert!(!a.is_session_started());
+    assert_eq!(a.active_session_id(), None);
 
-    // 1. Pressing Tab in Input focus cycles harness (`claude-code` -> `codex`)
-    //    and clears current session/timeline + queues CreateSession & RefreshHarnessCommands!
+    // 1. In draft, Tab cycles harness (`claude-code` -> `codex`) without creating a session yet
     a.handle_key(key(KeyCode::Tab));
     assert_eq!(a.harness, "codex");
-    assert!(a.current.is_none());
-    assert!(a.current_asd.is_none());
-    assert!(a.timeline.entries.is_empty());
-    assert_eq!(
-        a.take_actions(),
-        vec![Action::CreateSession { title: None }, Action::RefreshHarnessCommands]
-    );
+    assert!(a.new_session_draft);
+    assert!(!a.is_session_started());
+    assert_eq!(a.take_actions(), vec![Action::RefreshHarnessCommands]);
 
-    // 2. `/harness antigravity` switches harness and queues CreateSession & RefreshHarnessCommands
+    // 2. `/harness antigravity` switches harness in draft
     type_str(&mut a, "/harness antigravity");
     a.handle_key(key(KeyCode::Enter));
     assert_eq!(a.harness, "antigravity");
-    assert_eq!(
-        a.take_actions(),
-        vec![Action::CreateSession { title: None }, Action::RefreshHarnessCommands]
-    );
+    assert_eq!(a.take_actions(), vec![Action::RefreshHarnessCommands]);
 
-    // 3. Opening an existing session via `/sessions` (`OpenSession`) switches harness to match
-    //    that session WITHOUT calling `CreateSession`!
+    // 3. Opening an existing session via `/sessions` locks the harness
     type_str(&mut a, "/sessions");
     a.handle_key(key(KeyCode::Enter));
     assert_eq!(a.overlay, Some(Overlay::Sessions));
@@ -407,9 +400,43 @@ fn harness_switch_creates_new_session_but_open_session_does_not() {
     a.handle_key(key(KeyCode::Enter));
     assert_eq!(a.overlay, None);
     assert_eq!(a.harness, "cursor");
+    assert!(!a.new_session_draft);
+    assert!(a.is_session_started());
+    assert_eq!(a.active_session_id(), Some("asd-3".into()));
     let actions = a.take_actions();
     assert!(matches!(actions.as_slice(), [Action::OpenSession(s)] if s.harness_session_id == "cu-1"));
-    assert!(!actions.iter().any(|act| matches!(act, Action::CreateSession { .. })));
+
+    // 4. Once started, Tab / `/harness` / `switch_harness` / palette are locked!
+    a.handle_key(key(KeyCode::Tab));
+    assert_eq!(a.harness, "cursor");
+    assert!(a.take_actions().is_empty());
+
+    a.switch_harness("codex", None);
+    assert_eq!(a.harness, "cursor");
+    assert!(a.status.contains("locked"));
+    assert!(a.take_actions().is_empty());
+
+    type_str(&mut a, "/harness codex");
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.harness, "cursor");
+    assert!(a.status.contains("locked"));
+    assert!(a.take_actions().is_empty());
+
+    assert!(!a.all_slash_commands().iter().any(|c| c.name == "harness"));
+    assert!(!a.palette_items().iter().any(|c| c.name.starts_with("harness")));
+
+    // 5. `/new` resets back to draft where harness CAN be selected again
+    type_str(&mut a, "/new");
+    a.handle_key(key(KeyCode::Enter));
+    assert!(a.new_session_draft);
+    assert!(!a.is_session_started());
+    assert_eq!(a.active_session_id(), None);
+    assert!(a.take_actions().is_empty());
+
+    type_str(&mut a, "/harness codex");
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.harness, "codex");
+    assert_eq!(a.take_actions(), vec![Action::RefreshHarnessCommands]);
 }
 
 #[test]
@@ -423,6 +450,8 @@ fn ctrl_overlays_toggle_load_and_render_in_both_themes() {
     ];
     for (c, ov, title, first) in cases {
         let mut a = app();
+        a.current_asd = Some("asd-1".into());
+        a.new_session_draft = false;
         a.set_theme_mode(ThemeMode::Monochrome);
         a.handle_key(ctrl(c));
         assert_eq!(a.overlay, Some(ov), "ctrl+{c}");
@@ -571,6 +600,8 @@ fn routing_editor_saves_valid_json_only() {
 #[test]
 fn terminal_overlay_launch() {
     let mut a = app();
+    a.current_asd = Some("asd-1".into());
+    a.new_session_draft = false;
     a.set_theme_mode(ThemeMode::Monochrome);
     a.handle_key(ctrl('t'));
     a.take_actions();
@@ -647,12 +678,17 @@ fn sessions_modal_keys_and_search() {
 }
 
 #[test]
-fn model_picker_search_and_select_triggers_new_session_on_harness_change() {
+fn model_picker_switches_harness_in_draft_and_locks_harness_on_started_session() {
     let mut a = app();
     a.set_theme_mode(ThemeMode::Monochrome);
     a.models.insert("codex".into(), vec!["gpt-5".into(), "gpt-5-mini".into(), "o3".into()]);
+    a.models.insert("claude-code".into(), vec!["claude-sonnet-4".into(), "claude-opus-4".into()]);
+
+    // 1. In New Session draft, ModelPicker allows switching harness + model
     a.handle_key(ctrl('k'));
     assert_eq!(a.overlay, Some(Overlay::ModelPicker));
+    let draft_picker_txt = text(&render(&a));
+    assert!(draft_picker_txt.contains("claude-code") && draft_picker_txt.contains("codex"));
     a.handle_key(key(KeyCode::Tab)); // -> codex
     type_str(&mut a, "mini");
     assert_eq!(a.picker_models(), vec!["(default)".to_string(), "gpt-5-mini".into()]);
@@ -666,11 +702,178 @@ fn model_picker_search_and_select_triggers_new_session_on_harness_change() {
     assert_eq!(a.harness, "codex");
     assert_eq!(a.model.as_deref(), Some("gpt-5-mini"));
     assert_eq!(a.overlay, None);
-    // Because harness changed from claude-code -> codex, CreateSession + RefreshHarnessCommands are queued!
+    assert_eq!(a.take_actions(), vec![Action::RefreshHarnessCommands]);
+
+    // 2. Once a session is started, ModelPicker locks harness (hides other tabs) while allowing model changes
+    a.current_asd = Some("asd-1".into());
+    a.new_session_draft = false;
+    a.harness = "claude-code".into();
+    a.model = None;
+    a.set_status("Session active");
+
+    a.handle_key(ctrl('k'));
+    assert_eq!(a.overlay, Some(Overlay::ModelPicker));
+    let locked_txt = text(&render(&a));
+    assert!(locked_txt.contains("claude-code"));
+    assert!(locked_txt.contains("harness locked for started session"));
+    assert!(!locked_txt.contains("codex"));
+    assert!(!locked_txt.contains("opencode"));
+    assert!(!locked_txt.contains("antigravity"));
+    assert!(!locked_txt.contains("cursor"));
+
+    a.handle_key(key(KeyCode::Tab));
+    a.handle_key(key(KeyCode::Right));
+    assert_eq!(a.picker_harness, 0);
+
+    a.handle_key(key(KeyCode::Down));
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(a.overlay, None);
+    assert_eq!(a.harness, "claude-code");
+    assert_eq!(a.model.as_deref(), Some("claude-sonnet-4"));
+    assert!(a.take_actions().is_empty());
+}
+
+#[test]
+fn auto_approve_toggle_and_permission_modal_flow() {
+    let mut a = app();
+    assert!(a.auto_approve);
+    assert!(text(&render(&a)).contains("[auto:on]"));
+
+    // Toggle off in draft (does not push SetAutoApprove yet since no active session)
+    type_str(&mut a, "/auto-approve off");
+    a.handle_key(key(KeyCode::Enter));
+    assert!(!a.auto_approve);
+    assert!(a.take_actions().is_empty());
+    assert!(text(&render(&a)).contains("[auto:off]"));
+
+    // Bind a started session and toggle via `/auto-approve`
+    a.current_asd = Some("asd-1".into());
+    a.new_session_draft = false;
+    type_str(&mut a, "/auto-approve on");
+    a.handle_key(key(KeyCode::Enter));
+    assert!(a.auto_approve);
+    assert_eq!(a.take_actions(), vec![Action::SetAutoApprove(true)]);
+
+    type_str(&mut a, "/auto-approve");
+    a.handle_key(key(KeyCode::Enter));
+    assert!(!a.auto_approve);
+    assert_eq!(a.take_actions(), vec![Action::SetAutoApprove(false)]);
+
+    // Stream a PermissionRequest SSE event (also captures asd-... session_id if none)
+    a.current_asd = None;
+    a.timeline.begin_turn("run bash");
+    let (tx, rx) = mpsc::channel();
+    a.stream = Some(asd_nexus_cli::app::ActiveStream { handle: None, rx });
+    let mut p = SseParser::new();
+    let raw = concat!(
+        "data: {\"kind\":\"permission_request\",\"sessionId\":\"asd-99\",\"turnId\":\"turn-1\",\"permissionRequest\":{\"requestId\":\"req-1\",\"toolName\":\"Bash\",\"toolKind\":\"execute\",\"toolInput\":\"{\\\"command\\\":\\\"ls\\\"}\",\"locations\":[\"src/main.rs\"],\"options\":[{\"optionId\":\"allow_once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"},{\"optionId\":\"allow_always\",\"name\":\"Always allow\",\"kind\":\"allow_always\"},{\"optionId\":\"reject_once\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}\n\n",
+        "data: {\"kind\":\"permission_request\",\"turnId\":\"turn-1\",\"permissionRequest\":{\"requestId\":\"req-2\",\"toolName\":\"Edit\",\"options\":[]}}\n\n",
+    );
+    for m in p.feed(raw.as_bytes()) {
+        tx.send(m).unwrap();
+    }
+    a.drain_stream();
+    assert_eq!(a.current_asd.as_deref(), Some("asd-99"));
+    assert_eq!(a.pending_permissions.len(), 2);
+
+    // Render modal in both DarkColor & Monochrome
+    let dark_txt = text(&render(&a));
+    assert!(dark_txt.contains("PERMISSION APPROVAL"));
+    assert!(dark_txt.contains("Bash"));
+    assert!(dark_txt.contains("execute"));
+    assert!(dark_txt.contains("src/main.rs"));
+    assert!(dark_txt.contains("Allow once"));
+    a.set_theme_mode(ThemeMode::Monochrome);
+    assert_monochrome(&render(&a));
+
+    // Press `y` on first request -> allow_once
+    a.handle_key(ch('y'));
     assert_eq!(
         a.take_actions(),
-        vec![Action::CreateSession { title: None }, Action::RefreshHarnessCommands]
+        vec![Action::RespondPermission {
+            turn_id: "turn-1".into(),
+            request_id: "req-1".into(),
+            outcome: "selected".into(),
+            option_id: Some("allow_once".into()),
+        }]
     );
+    assert_eq!(a.pending_permissions.len(), 1);
+
+    // Second request has empty options (fallback Allow / Reject): Down + Enter rejects ("cancelled")
+    a.handle_key(key(KeyCode::Down));
+    a.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        a.take_actions(),
+        vec![Action::RespondPermission {
+            turn_id: "turn-1".into(),
+            request_id: "req-2".into(),
+            outcome: "cancelled".into(),
+            option_id: None,
+        }]
+    );
+    assert!(a.pending_permissions.is_empty());
+
+    // Verify `a` (allow_always) sets auto_approve = true and `n` / `Esc` rejects
+    a.pending_permissions.push_back((
+        "turn-2".into(),
+        PermissionRequestPayload {
+            request_id: "req-3".into(),
+            tool_name: "Write".into(),
+            options: vec![
+                PermissionOptionItem {
+                    option_id: "allow_once".into(),
+                    name: "Allow once".into(),
+                    kind: "allow_once".into(),
+                },
+                PermissionOptionItem {
+                    option_id: "allow_always".into(),
+                    name: "Always allow".into(),
+                    kind: "allow_always".into(),
+                },
+                PermissionOptionItem {
+                    option_id: "reject_once".into(),
+                    name: "Reject".into(),
+                    kind: "reject_once".into(),
+                },
+            ],
+            ..Default::default()
+        },
+    ));
+    a.pending_permissions.push_back((
+        "turn-2".into(),
+        PermissionRequestPayload {
+            request_id: "req-4".into(),
+            tool_name: "Bash".into(),
+            options: vec![PermissionOptionItem {
+                option_id: "reject_once".into(),
+                name: "Reject".into(),
+                kind: "reject_once".into(),
+            }],
+            ..Default::default()
+        },
+    ));
+    a.handle_key(ch('a'));
+    assert!(a.auto_approve);
+    assert_eq!(
+        a.take_actions(),
+        vec![Action::RespondPermission {
+            turn_id: "turn-2".into(),
+            request_id: "req-3".into(),
+            outcome: "selected".into(),
+            option_id: Some("allow_always".into()),
+        }]
+    );
+    a.handle_key(ch('n'));
+    assert_eq!(
+        a.take_actions(),
+        vec![Action::RespondPermission {
+            turn_id: "turn-2".into(),
+            request_id: "req-4".into(),
+            outcome: "selected".into(),
+            option_id: Some("reject_once".into()),
+        }]
+    );
+    assert!(a.pending_permissions.is_empty());
 }
 
 #[test]

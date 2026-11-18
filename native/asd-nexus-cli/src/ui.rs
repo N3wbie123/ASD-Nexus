@@ -163,6 +163,9 @@ pub fn draw(f: &mut Frame, app: &App) {
             inner,
         );
     }
+    if !app.pending_permissions.is_empty() {
+        draw_permission_modal(f, area, app);
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -287,7 +290,11 @@ fn draw_input_card(f: &mut Frame, area: Rect, app: &App) {
 
     f.render_widget(Block::default().style(theme::surface()), card);
 
-    let focused = app.focus == Focus::Input && app.overlay.is_none() && app.prompt.is_none() && app.confirm.is_none();
+    let focused = app.focus == Focus::Input
+        && app.pending_permissions.is_empty()
+        && app.overlay.is_none()
+        && app.prompt.is_none()
+        && app.confirm.is_none();
     let bar = if focused { "┃ " } else { "│ " };
     let bar_style = if focused { theme::surface_accent() } else { theme::surface_faint() };
 
@@ -336,6 +343,9 @@ fn draw_input_card(f: &mut Frame, area: Rect, app: &App) {
     }
 
     // Status pill row at the bottom of the input card
+    let auto_label = if app.auto_approve { "[auto:on]" } else { "[auto:off]" };
+    let auto_style = if app.auto_approve { theme::surface_muted() } else { theme::badge() };
+    let tab_hint = if app.is_session_started() { "" } else { " · Tab switch harness" };
     let pill = Line::from(vec![
         Span::styled(bar, bar_style),
         Span::styled(format!(" {} ", app.harness), theme::harness_badge()),
@@ -343,9 +353,10 @@ fn draw_input_card(f: &mut Frame, area: Rect, app: &App) {
             format!(" · {} ", app.model.as_deref().unwrap_or("(default)")),
             theme::surface_muted(),
         ),
+        Span::styled(format!(" {auto_label} "), auto_style),
         Span::styled(format!("· {} ", short(&app.project_root, 34)), theme::surface_faint()),
         Span::styled(
-            " · Enter send · Shift+Enter newline · Tab switch harness · / cmd · @ file · ! shell",
+            format!(" · Enter send · Shift+Enter newline{tab_hint} · / cmd · @ file · ! shell"),
             theme::surface_faint(),
         ),
     ]);
@@ -1019,7 +1030,13 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_picker(f: &mut Frame, area: Rect, app: &App) {
-    let inner = popup(f, area, "HARNESS & MODEL  (Ctrl+K / /models)");
+    let started = app.is_session_started();
+    let title = if started {
+        "MODEL PICKER  (Ctrl+K / /models)"
+    } else {
+        "HARNESS & MODEL  (Ctrl+K / /models)"
+    };
+    let inner = popup(f, area, title);
     let [tabs, q, list_a, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -1027,23 +1044,36 @@ fn draw_picker(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(1),
     ])
     .areas(inner);
-    let spans: Vec<Span> = HARNESSES
-        .iter()
-        .enumerate()
-        .map(|(i, h)| {
-            Span::styled(
-                format!(" {h} "),
-                if i == app.picker_harness { theme::selected() } else { theme::muted() },
-            )
-        })
-        .collect();
-    f.render_widget(Paragraph::new(Line::from(spans)).style(theme::panel()), tabs);
+    if started {
+        let spans = vec![
+            Span::styled(format!(" {} ", app.harness), theme::harness_badge()),
+            Span::styled("  (harness locked for started session; /new to switch)", theme::muted()),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)).style(theme::panel()), tabs);
+    } else {
+        let spans: Vec<Span> = HARNESSES
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                Span::styled(
+                    format!(" {h} "),
+                    if i == app.picker_harness { theme::selected() } else { theme::muted() },
+                )
+            })
+            .collect();
+        f.render_widget(Paragraph::new(Line::from(spans)).style(theme::panel()), tabs);
+    }
     f.render_widget(Paragraph::new(format!(" search: {}█", app.picker_query)).style(theme::bold()), q);
+    let active_harness = if started {
+        app.harness.as_str()
+    } else {
+        HARNESSES[app.picker_harness]
+    };
     let models = app.picker_models();
     let items: Vec<ListItem> = models
         .iter()
         .map(|m| {
-            let cur = app.harness == HARNESSES[app.picker_harness]
+            let cur = app.harness == active_harness
                 && (app.model.as_deref() == Some(m.as_str()) || (app.model.is_none() && m == "(default)"));
             ListItem::new(format!("{} {m}", if cur { "●" } else { " " }))
         })
@@ -1054,10 +1084,97 @@ fn draw_picker(f: &mut Frame, area: Rect, app: &App) {
         list_a,
         &mut st,
     );
+    let hint = if started {
+        " type to filter · ↑↓ select · F5 refresh models · Enter apply · Esc close"
+    } else {
+        " type to filter · ↑↓ select · Tab/←→ harness · F5 refresh models · Enter apply · Esc close"
+    };
+    f.render_widget(Paragraph::new(hint).style(theme::faint()), keys);
+}
+
+fn draw_permission_modal(f: &mut Frame, area: Rect, app: &App) {
+    let Some((_, perm)) = app.pending_permissions.front() else {
+        return;
+    };
+    let title = if app.pending_permissions.len() > 1 {
+        format!("PERMISSION APPROVAL ({} pending)", app.pending_permissions.len())
+    } else {
+        "PERMISSION APPROVAL".into()
+    };
+    let a = centered(area, 72, 58);
+    let inner = popup(f, a, &title);
+
+    let option_labels: Vec<String> = if perm.options.is_empty() {
+        vec!["Allow once (allow_once)".into(), "Reject (reject_once)".into()]
+    } else {
+        perm.options
+            .iter()
+            .map(|o| format!("{} ({})", o.name, o.kind))
+            .collect()
+    };
+    let opts_h = (option_labels.len() as u16).clamp(2, 6);
+
+    let [details_a, opts_a, keys_a] = Layout::vertical([
+        Constraint::Min(4),
+        Constraint::Length(opts_h),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let mut detail_lines: Vec<Line> = Vec::new();
+    let mut tool_spans = vec![
+        Span::styled(" Tool: ", theme::muted()),
+        Span::styled(perm.tool_name.clone(), theme::bold()),
+    ];
+    if let Some(kind) = &perm.tool_kind {
+        tool_spans.push(Span::styled(format!("  [{kind}]"), theme::harness_badge()));
+    }
+    detail_lines.push(Line::from(tool_spans));
+
+    if let Some(locs) = &perm.locations {
+        if !locs.is_empty() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(" Locations: ", theme::muted()),
+                Span::styled(locs.join(", "), theme::panel()),
+            ]));
+        }
+    }
+
+    if let Some(input) = &perm.tool_input {
+        if !input.trim().is_empty() {
+            detail_lines.push(Line::styled(" Input:", theme::muted()));
+            let preview: String = input.chars().take(400).collect();
+            for line in wrap(&preview, details_a.width.saturating_sub(4) as usize) {
+                detail_lines.push(Line::styled(format!("   {line}"), theme::panel()));
+            }
+        }
+    }
     f.render_widget(
-        Paragraph::new(" type to filter · ↑↓ select · Tab/←→ harness · F5 refresh models · Enter apply · Esc close")
-            .style(theme::faint()),
-        keys,
+        Paragraph::new(detail_lines)
+            .style(theme::panel())
+            .wrap(Wrap { trim: false }),
+        details_a,
+    );
+
+    let items: Vec<ListItem> = option_labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let marker = if i == app.permission_sel { "▶" } else { " " };
+            ListItem::new(format!(" {marker} {label}"))
+        })
+        .collect();
+    let mut st = ListState::default().with_selected(Some(app.permission_sel.min(items.len().saturating_sub(1))));
+    f.render_stateful_widget(
+        List::new(items)
+            .style(theme::panel())
+            .highlight_style(theme::selected()),
+        opts_a,
+        &mut st,
+    );
+    f.render_widget(
+        Paragraph::new(" ↑/↓ select · Enter confirm · y allow · a always · n/Esc reject").style(theme::faint()),
+        keys_a,
     );
 }
 
