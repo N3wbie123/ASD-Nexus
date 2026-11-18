@@ -633,3 +633,60 @@ export interface TerminalOpenResponse {
   launched?: boolean;
   error?: string;
 }
+
+// ============================================================================
+// Harness Slash Commands & Skills Discovery
+// ============================================================================
+
+export type HarnessCommandSource = "builtin" | "global" | "project";
+
+export type HarnessCommandKind = "command" | "skill" | "workflow";
+
+export interface HarnessCommandItem {
+  /** Normalized command name without leading slash (e.g. "compact", "asd-plan"). */
+  name: string;
+  description: string;
+  harness: string;
+  source: HarnessCommandSource;
+  kind: HarnessCommandKind;
+  path?: string;
+}
+
+export interface GetHarnessCommandsRequest {
+  harness?: string;
+  projectRoot?: string;
+}
+
+export interface GetHarnessCommandsResponse {
+  commands: HarnessCommandItem[];
+}
+
+// ============================================================================
+// Workspace Files & Directories Listing (GET /api/fs/list)
+// ============================================================================
+
+export type FsListMode = "files" | "dirs";
+
+export interface FsListEntry {
+  /** Relative path from projectRoot (for files) or display path (for dirs). */
+  path: string;
+  /** Basename of the file or directory. */
+  name: string;
+  isDir: boolean;
+}
+
+export interface FsListRequest {
+  projectRoot?: string;
+  mode?: FsListMode;
+  prefix?: string;
+  limit?: number;
+}
+
+export interface FsListResponse {
+  projectRoot: string;
+  mode: FsListMode;
+  baseDir: string;
+  entries: FsListEntry[];
+  truncated?: boolean;
+}
+

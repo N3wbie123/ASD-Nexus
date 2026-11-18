@@ -49,6 +49,9 @@ import {
   subagentActionRoute,
 } from "./routes/subagents.ts";
 import { terminalOpenRoute } from "./routes/terminal.ts";
+import { getHarnessCommandsRoute } from "./routes/commands.ts";
+import { fsListRoute } from "./routes/fs.ts";
+import { discoverHarnessModelsWithCache } from "./model-catalog.ts";
 
 export interface OrchestratorDeps {
   version: string;
@@ -167,7 +170,7 @@ export function createDefaultDeps(): OrchestratorDeps {
     resolveAsdPaths: sdk.resolveAsdPaths,
     openProjectDb: sdk.openProjectDb,
     withReadOnlyProjectDb: sdk.withReadOnlyProjectDb,
-    discoverHarnessModels: sdk.discoverHarnessModels,
+    discoverHarnessModels: discoverHarnessModelsWithCache,
     loadRoutingConfig: sdk.loadRoutingConfig,
     saveProjectRoutingConfig: sdk.saveProjectRoutingConfig,
     discoverProjectCliSessions: sdk.discoverProjectCliSessions,
@@ -373,6 +376,14 @@ async function matchAndDispatchRoute(ctx: RequestContext): Promise<void> {
   }
   if (method === "POST" && path === "/api/terminal/open") {
     terminalOpenRoute(ctx);
+    return;
+  }
+  if (method === "GET" && path === "/api/harness-commands") {
+    getHarnessCommandsRoute(ctx);
+    return;
+  }
+  if (method === "GET" && path === "/api/fs/list") {
+    fsListRoute(ctx);
     return;
   }
 

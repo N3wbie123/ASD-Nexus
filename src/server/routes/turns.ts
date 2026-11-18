@@ -5,6 +5,7 @@ import {
   createHarnessStreamNormalizer,
   normalizeDriverStreamEvent,
 } from "../normalizer.ts";
+import { resolveSlashCommandPromptForTurn } from "./commands.ts";
 import type {
   TurnStreamRequest,
   TurnStreamAccepted,
@@ -305,11 +306,18 @@ async function executeTurn(
       }
     };
 
+    const resolvedSlash = resolveSlashCommandPromptForTurn({
+      prompt: body.prompt || "",
+      harness: prepared.harness,
+      projectRoot,
+      homeDir: ctx.homeDir,
+    });
+
     const result = await ctx.deps.runDriverTurn({
       projectRoot,
       db: prepared.db,
       sessionId: prepared.asdSessionId,
-      prompt: body.prompt || "",
+      prompt: resolvedSlash.prompt,
       model: body.model,
       streamJson: body.streaming ?? true,
       signal: turn.abortController.signal,

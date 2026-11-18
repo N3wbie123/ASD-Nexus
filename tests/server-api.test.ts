@@ -43,8 +43,11 @@ import {
   type SubagentLogTailResponse,
   type SubagentActionResponse,
   type TerminalOpenResponse,
+  type GetHarnessCommandsResponse,
+  type FsListResponse,
   type OrchestratorEvent,
 } from "../src/shared/protocol.ts";
+import { resolveSlashCommandPromptForTurn } from "../src/server/routes/commands.ts";
 
 async function startTestServer(
   deps?: Partial<OrchestratorDeps>,
@@ -1211,6 +1214,384 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         assert.equal(data.launched, false);
       } finally {
         await close();
+      }
+    });
+  });
+
+  describe("Harness Commands, Workspace FS List & Slash Prompt Expansion", () => {
+    it("GET /api/harness-commands returns builtin, isolated global (homeDir), and project commands/skills across all 5 harnesses", async () => {
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-cmds-home-"));
+      const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-cmds-proj-"));
+
+      try {
+        // 1. claude-code: global command + project skill
+        const ccGlobalCmdDir = path.join(tmpHome, ".claude", "commands");
+        fs.mkdirSync(ccGlobalCmdDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(ccGlobalCmdDir, "deploy-cc.md"),
+          "---\ndescription: Deploy via Claude Code\n---\nRun deployment steps."
+        );
+        const ccProjSkillDir = path.join(tmpProject, ".claude", "skills", "proj-lint");
+        fs.mkdirSync(ccProjSkillDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(ccProjSkillDir, "SKILL.md"),
+          "# Project Lint Skill\nRun eslint on src."
+        );
+
+        // 2. opencode: global command + project skill
+        const ocGlobalCmdDir = path.join(tmpHome, ".config", "opencode", "command");
+        fs.mkdirSync(ocGlobalCmdDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(ocGlobalCmdDir, "oc-audit.md"),
+          "---\ndescription: OpenCode security audit\n---\nAudit repository."
+        );
+        const ocProjCmdDir = path.join(tmpProject, ".opencode", "commands");
+        fs.mkdirSync(ocProjCmdDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(ocProjCmdDir, "oc-local.md"),
+          "Local opencode command description\nDetails here."
+        );
+
+        // 3. codex: global prompts + project .agents/skills
+        const cxGlobalPrompts = path.join(tmpHome, ".codex", "prompts");
+        fs.mkdirSync(cxGlobalPrompts, { recursive: true });
+        fs.writeFileSync(
+          path.join(cxGlobalPrompts, "cx-prompt.md"),
+          "---\ndescription: Codex custom prompt\n---\nPrompt body."
+        );
+        const cxProjSkill = path.join(tmpProject, ".agents", "skills", "cx-agent-skill");
+        fs.mkdirSync(cxProjSkill, { recursive: true });
+        fs.writeFileSync(
+          path.join(cxProjSkill, "SKILL.md"),
+          "---\nname: cx-agent-skill\ndescription: Shared agent skill for Codex\n---\nExecute agent skill."
+        );
+
+        // 4. antigravity: global builtin skill + project .agent/workflows
+        const agBuiltinSkill = path.join(
+          tmpHome,
+          ".gemini",
+          "antigravity-cli",
+          "builtin",
+          "skills",
+          "ag-builtin-helper"
+        );
+        fs.mkdirSync(agBuiltinSkill, { recursive: true });
+        fs.writeFileSync(
+          path.join(agBuiltinSkill, "SKILL.md"),
+          "---\ndescription: Antigravity builtin skill helper\n---\nHelper instructions."
+        );
+        const agProjWorkflow = path.join(tmpProject, ".agent", "workflows");
+        fs.mkdirSync(agProjWorkflow, { recursive: true });
+        fs.writeFileSync(
+          path.join(agProjWorkflow, "release-wf.md"),
+          "---\ndescription: Release workflow for Antigravity\n---\nStep 1: test."
+        );
+
+        // 5. cursor: global skill + project command
+        const crGlobalSkill = path.join(tmpHome, ".cursor", "skills", "cr-global-skill");
+        fs.mkdirSync(crGlobalSkill, { recursive: true });
+        fs.writeFileSync(
+          path.join(crGlobalSkill, "SKILL.md"),
+          "---\ndescription: Cursor global skill\n---\nDo cursor skill."
+        );
+        const crProjCmd = path.join(tmpProject, ".cursor", "commands");
+        fs.mkdirSync(crProjCmd, { recursive: true });
+        fs.writeFileSync(
+          path.join(crProjCmd, "cr-fix.md"),
+          "Fix cursor lint issues quickly."
+        );
+
+        const { baseUrl, close } = await startTestServer(
+          {},
+          { defaultProjectRoot: tmpProject, homeDir: tmpHome }
+        );
+
+        try {
+          // Query all harnesses
+          const resAll = await fetch(
+            `${baseUrl}/api/harness-commands?projectRoot=${encodeURIComponent(tmpProject)}`
+          );
+          assert.equal(resAll.status, 200);
+          const allData = (await resAll.json()) as GetHarnessCommandsResponse;
+          assert.ok(allData.commands.length > 20);
+
+          // Verify claude-code filter
+          const resCc = await fetch(
+            `${baseUrl}/api/harness-commands?harness=claude-code&projectRoot=${encodeURIComponent(tmpProject)}`
+          );
+          const ccData = (await resCc.json()) as GetHarnessCommandsResponse;
+          assert.ok(ccData.commands.every((c) => c.harness === "claude-code"));
+          assert.ok(
+            ccData.commands.some((c) => c.name === "compact" && c.source === "builtin")
+          );
+          const ccGlobal = ccData.commands.find((c) => c.name === "deploy-cc");
+          assert.ok(ccGlobal);
+          assert.equal(ccGlobal.source, "global");
+          assert.equal(ccGlobal.kind, "command");
+          assert.equal(ccGlobal.description, "Deploy via Claude Code");
+
+          const ccProj = ccData.commands.find((c) => c.name === "proj-lint");
+          assert.ok(ccProj);
+          assert.equal(ccProj.source, "project");
+          assert.equal(ccProj.kind, "skill");
+          assert.equal(ccProj.description, "Project Lint Skill");
+
+          // Verify opencode filter
+          const resOc = await fetch(
+            `${baseUrl}/api/harness-commands?harness=opencode&projectRoot=${encodeURIComponent(tmpProject)}`
+          );
+          const ocData = (await resOc.json()) as GetHarnessCommandsResponse;
+          assert.ok(ocData.commands.some((c) => c.name === "undo" && c.source === "builtin"));
+          assert.ok(
+            ocData.commands.some(
+              (c) =>
+                c.name === "oc-audit" &&
+                c.source === "global" &&
+                c.description === "OpenCode security audit"
+            )
+          );
+          assert.ok(
+            ocData.commands.some(
+              (c) =>
+                c.name === "oc-local" &&
+                c.source === "project" &&
+                c.description === "Local opencode command description"
+            )
+          );
+
+          // Verify codex filter
+          const resCx = await fetch(
+            `${baseUrl}/api/harness-commands?harness=codex&projectRoot=${encodeURIComponent(tmpProject)}`
+          );
+          const cxData = (await resCx.json()) as GetHarnessCommandsResponse;
+          assert.ok(cxData.commands.some((c) => c.name === "diff" && c.source === "builtin"));
+          assert.ok(
+            cxData.commands.some((c) => c.name === "cx-prompt" && c.source === "global")
+          );
+          assert.ok(
+            cxData.commands.some(
+              (c) =>
+                c.name === "cx-agent-skill" &&
+                c.source === "project" &&
+                c.kind === "skill"
+            )
+          );
+
+          // Verify antigravity filter
+          const resAg = await fetch(
+            `${baseUrl}/api/harness-commands?harness=antigravity&projectRoot=${encodeURIComponent(tmpProject)}`
+          );
+          const agData = (await resAg.json()) as GetHarnessCommandsResponse;
+          assert.ok(agData.commands.some((c) => c.name === "plan" && c.source === "builtin"));
+          assert.ok(
+            agData.commands.some(
+              (c) =>
+                c.name === "ag-builtin-helper" &&
+                c.source === "global" &&
+                c.kind === "skill"
+            )
+          );
+          assert.ok(
+            agData.commands.some(
+              (c) =>
+                c.name === "release-wf" &&
+                c.source === "project" &&
+                c.kind === "workflow"
+            )
+          );
+
+          // Verify cursor filter
+          const resCr = await fetch(
+            `${baseUrl}/api/harness-commands?harness=cursor&projectRoot=${encodeURIComponent(tmpProject)}`
+          );
+          const crData = (await resCr.json()) as GetHarnessCommandsResponse;
+          assert.ok(
+            crData.commands.some(
+              (c) => c.name === "cr-global-skill" && c.source === "global" && c.kind === "skill"
+            )
+          );
+          assert.ok(
+            crData.commands.some(
+              (c) =>
+                c.name === "cr-fix" &&
+                c.source === "project" &&
+                c.description === "Fix cursor lint issues quickly."
+            )
+          );
+        } finally {
+          await close();
+        }
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+        fs.rmSync(tmpProject, { recursive: true, force: true });
+      }
+    });
+
+    it("GET /api/fs/list supports mode=files (excluding heavy ignored dirs + prefix filter) and mode=dirs navigation", async () => {
+      const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-fs-list-"));
+      try {
+        fs.mkdirSync(path.join(tmpProject, "src", "components"), { recursive: true });
+        fs.mkdirSync(path.join(tmpProject, "docs"), { recursive: true });
+        fs.mkdirSync(path.join(tmpProject, "node_modules", "pkg"), { recursive: true });
+        fs.mkdirSync(path.join(tmpProject, ".git", "objects"), { recursive: true });
+        fs.mkdirSync(path.join(tmpProject, "target", "debug"), { recursive: true });
+        fs.mkdirSync(path.join(tmpProject, ".asd", "sessions"), { recursive: true });
+
+        fs.writeFileSync(path.join(tmpProject, "src", "index.ts"), "export {};");
+        fs.writeFileSync(path.join(tmpProject, "src", "components", "Button.tsx"), "export {};");
+        fs.writeFileSync(path.join(tmpProject, "docs", "guide.md"), "# Guide");
+        fs.writeFileSync(path.join(tmpProject, "node_modules", "pkg", "index.js"), "");
+        fs.writeFileSync(path.join(tmpProject, ".git", "objects", "obj"), "");
+        fs.writeFileSync(path.join(tmpProject, "target", "debug", "bin"), "");
+        fs.writeFileSync(path.join(tmpProject, ".asd", "sessions", "s.json"), "{}");
+
+        const { baseUrl, close } = await startTestServer(
+          {},
+          { defaultProjectRoot: tmpProject }
+        );
+
+        try {
+          // 1. mode=files all
+          const resFiles = await fetch(
+            `${baseUrl}/api/fs/list?mode=files&projectRoot=${encodeURIComponent(tmpProject)}`
+          );
+          assert.equal(resFiles.status, 200);
+          const dataFiles = (await resFiles.json()) as FsListResponse;
+          assert.equal(dataFiles.mode, "files");
+          const paths = dataFiles.entries.map((e) => e.path);
+          assert.ok(paths.includes("src/index.ts"));
+          assert.ok(paths.includes("src/components/Button.tsx"));
+          assert.ok(paths.includes("docs/guide.md"));
+          assert.ok(!paths.some((p) => p.includes("node_modules")));
+          assert.ok(!paths.some((p) => p.includes(".git")));
+          assert.ok(!paths.some((p) => p.includes("target")));
+          assert.ok(!paths.some((p) => p.includes(".asd")));
+
+          // 2. mode=files with prefix filter
+          const resPrefix = await fetch(
+            `${baseUrl}/api/fs/list?mode=files&prefix=butt&projectRoot=${encodeURIComponent(tmpProject)}`
+          );
+          const dataPrefix = (await resPrefix.json()) as FsListResponse;
+          assert.equal(dataPrefix.entries.length, 1);
+          assert.equal(dataPrefix.entries[0]?.path, "src/components/Button.tsx");
+
+          // 3. mode=dirs at root
+          const resDirs = await fetch(
+            `${baseUrl}/api/fs/list?mode=dirs&projectRoot=${encodeURIComponent(tmpProject)}`
+          );
+          const dataDirs = (await resDirs.json()) as FsListResponse;
+          assert.equal(dataDirs.mode, "dirs");
+          const dirNames = dataDirs.entries.map((e) => e.name);
+          assert.ok(dirNames.includes(".."));
+          assert.ok(dirNames.includes("src"));
+          assert.ok(dirNames.includes("docs"));
+          assert.ok(!dirNames.includes("node_modules"));
+          assert.ok(!dirNames.includes(".git"));
+
+          // 4. mode=dirs with partial prefix "src/"
+          const resSubDirs = await fetch(
+            `${baseUrl}/api/fs/list?mode=dirs&prefix=${encodeURIComponent("src/")}&projectRoot=${encodeURIComponent(tmpProject)}`
+          );
+          const dataSubDirs = (await resSubDirs.json()) as FsListResponse;
+          assert.ok(dataSubDirs.entries.some((e) => e.name === "components" && e.isDir));
+        } finally {
+          await close();
+        }
+      } finally {
+        fs.rmSync(tmpProject, { recursive: true, force: true });
+      }
+    });
+
+    it("turns.ts preserves builtin /commands and expands custom .md commands/skills across harnesses", async () => {
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-slash-home-"));
+      const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-slash-proj-"));
+
+      try {
+        const skillDir = path.join(tmpProject, ".codex", "skills", "my-custom-skill");
+        fs.mkdirSync(skillDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(skillDir, "SKILL.md"),
+          "---\nname: my-custom-skill\ndescription: Custom Codex Skill\n---\nAlways reply with CUSTOM_SKILL_OK."
+        );
+
+        // Unit check: builtin command is untouched
+        const builtinRes = resolveSlashCommandPromptForTurn({
+          prompt: "/compact",
+          harness: "codex",
+          projectRoot: tmpProject,
+          homeDir: tmpHome,
+        });
+        assert.equal(builtinRes.expanded, false);
+        assert.equal(builtinRes.prompt, "/compact");
+
+        // Unit check: custom skill is expanded with template + arguments
+        const customRes = resolveSlashCommandPromptForTurn({
+          prompt: "/my-custom-skill target=src/app.ts",
+          harness: "codex",
+          projectRoot: tmpProject,
+          homeDir: tmpHome,
+        });
+        assert.equal(customRes.expanded, true);
+        assert.ok(customRes.prompt.includes("Always reply with CUSTOM_SKILL_OK."));
+        assert.ok(customRes.prompt.includes("target=src/app.ts"));
+
+        // Integration check via POST /api/turn/stream
+        const receivedPrompts: string[] = [];
+        const { baseUrl, close } = await startTestServer(
+          {
+            runDriverTurn: async (input) => {
+              receivedPrompts.push(input.prompt);
+              input.onEvent?.({
+                type: "text",
+                harness: input.db.getActiveDriver(input.sessionId)?.harness || "codex",
+                text: "Executed",
+                timestamp: Date.now(),
+              });
+              return { exitCode: 0, harnessSessionId: "thr-slash-1" } as any;
+            },
+          },
+          { defaultProjectRoot: tmpProject, homeDir: tmpHome }
+        );
+
+        try {
+          // 1. Send builtin /compact
+          const res1 = await fetch(`${baseUrl}/api/turn/stream`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+            },
+            body: JSON.stringify({
+              projectRoot: tmpProject,
+              harness: "codex",
+              prompt: "/compact",
+            }),
+          });
+          await res1.text();
+          assert.equal(receivedPrompts[0], "/compact");
+
+          // 2. Send custom /my-custom-skill with arguments
+          const res2 = await fetch(`${baseUrl}/api/turn/stream`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+            },
+            body: JSON.stringify({
+              projectRoot: tmpProject,
+              harness: "codex",
+              prompt: "/my-custom-skill --fast",
+            }),
+          });
+          await res2.text();
+          assert.ok(receivedPrompts[1]?.includes("Always reply with CUSTOM_SKILL_OK."));
+          assert.ok(receivedPrompts[1]?.includes("--fast"));
+        } finally {
+          await close();
+        }
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+        fs.rmSync(tmpProject, { recursive: true, force: true });
       }
     });
   });
