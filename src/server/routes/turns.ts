@@ -1,6 +1,12 @@
 import type { RequestContext } from "./types.ts";
 import { sendJson } from "./types.ts";
-import type { HarnessId, SqliteDriver } from "../sdk.ts";
+import type {
+  AcpRequestPermissionParams,
+  AcpRequestPermissionResult,
+  DriverStreamEvent,
+  HarnessId,
+  SqliteDriver,
+} from "../sdk.ts";
 import {
   createHarnessStreamNormalizer,
   normalizeDriverStreamEvent,
@@ -530,7 +536,9 @@ async function executeTurn(
       autoApprove: prepared.autoApprove,
       signal: turn.abortController.signal,
       homeDir: ctx.homeDir,
-      onPermissionRequest: async (acpParams: any) => {
+      onPermissionRequest: async (
+        acpParams: AcpRequestPermissionParams
+      ): Promise<AcpRequestPermissionResult> => {
         const decision = await requestTurnPermission(
           turn.turnId,
           normalizePermissionParams(acpParams)
@@ -541,7 +549,7 @@ async function executeTurn(
         sawRawOutput = true;
         forwardNormalizedEvents(rawNormalizer.pushChunk(chunk));
       },
-      onEvent: (driverEvent: any) => {
+      onEvent: (driverEvent: DriverStreamEvent) => {
         if (driverEvent?.harnessSessionId) {
           discoveredHarnessSessionId = driverEvent.harnessSessionId;
         }
@@ -662,6 +670,9 @@ export function turnCancelRoute(ctx: RequestContext): void {
   const turn = activeTurns.get(turnId);
   if (turn) {
     cancelPendingPermissions(turn);
+    if (turn.sessionId) {
+      ctx.deps.cancelDriverTurn?.(turn.sessionId);
+    }
     turn.abortController.abort();
     broadcastEvent(turn, {
       kind: "status",
@@ -678,6 +689,10 @@ export function turnCancelRoute(ctx: RequestContext): void {
       message: "Turn cancelled successfully",
     } satisfies TurnCancelResponse);
     return;
+  }
+
+  if (body.sessionId) {
+    ctx.deps.cancelDriverTurn?.(body.sessionId);
   }
 
   sendJson(ctx.res, 200, {

@@ -715,13 +715,13 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         ...mockDb.deps,
         runDriverTurn: async (input) => {
           assert.ok(input.db);
-          input.onEvent({
+          input.onEvent?.({
             type: "thinking",
             harness: "claude-code",
             thinking: "Analyzing problem",
             timestamp: Date.now(),
           });
-          input.onEvent({
+          input.onEvent?.({
             type: "text",
             harness: "claude-code",
             text: "Hello user",
@@ -798,8 +798,8 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
       const { baseUrl, close } = await startTestServer({
         ...mockDb.deps,
         runDriverTurn: async (input) => {
-          return new Promise<any>((resolve, reject) => {
-            input.signal.addEventListener("abort", () => {
+          return new Promise<any>((_resolve, reject) => {
+            input.signal?.addEventListener("abort", () => {
               const err = new Error("AbortError");
               err.name = "AbortError";
               reject(err);
@@ -993,19 +993,20 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
         {
           runDriverTurn: async (input) => {
             const active = input.db.getActiveDriver(input.sessionId);
+            const activeHarness = (active?.harness || "claude-code") as sdk.HarnessId;
             seenModels.push(active?.model ?? null);
-            seenInputModels.push(input.model);
+            seenInputModels.push(input.model ?? undefined);
             sdk.attachDriver(input.db, {
               projectRoot: input.projectRoot,
               sessionId: input.sessionId,
-              harness: active?.harness || "claude-code",
+              harness: activeHarness,
               model: active?.model ?? null,
               harnessSessionId: "cl-sid-immutable-1",
               source: "user",
             });
             input.onEvent?.({
               type: "text",
-              harness: active?.harness || "claude-code",
+              harness: activeHarness,
               text: `Model=${active?.model ?? "default"}`,
               timestamp: Date.now(),
             });
@@ -1133,7 +1134,8 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
             assert.equal(typeof input.onPermissionRequest, "function");
 
             // 1. Interactive permission prompt (must wait for POST /api/turn/permission)
-            const firstDecision = await input.onPermissionRequest({
+            const firstDecision = await input.onPermissionRequest!({
+              sessionId: input.sessionId,
               toolCall: {
                 title: "Write src/index.ts",
                 kind: "edit",
@@ -1149,7 +1151,8 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
             permissionResults.push(firstDecision);
 
             // 2. After allow_always, subsequent permission request in same turn auto-approves immediately
-            const secondDecision = await input.onPermissionRequest({
+            const secondDecision = await input.onPermissionRequest!({
+              sessionId: input.sessionId,
               toolCall: {
                 title: "Run tests",
                 kind: "execute",
@@ -1288,13 +1291,15 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
       const { baseUrl, close } = await startTestServer(
         {
           runDriverTurn: async (input) => {
-            const firstDecision = await input.onPermissionRequest({
+            const firstDecision = await input.onPermissionRequest!({
+              sessionId: input.sessionId,
               toolCall: { title: "Edit file", kind: "edit" },
               options: [],
             });
             permissionResults.push(firstDecision);
 
-            const secondDecision = await input.onPermissionRequest({
+            const secondDecision = await input.onPermissionRequest!({
+              sessionId: input.sessionId,
               toolCall: { title: "Second action", kind: "execute" },
               options: [
                 { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
@@ -2048,7 +2053,8 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
               receivedPrompts.push(input.prompt);
               input.onEvent?.({
                 type: "text",
-                harness: input.db.getActiveDriver(input.sessionId)?.harness || "codex",
+                harness: (input.db.getActiveDriver(input.sessionId)?.harness ||
+                  "codex") as sdk.HarnessId,
                 text: "Executed",
                 timestamp: Date.now(),
               });
@@ -2169,6 +2175,236 @@ describe("Clean-room Sidecar HTTP/SSE Server & Ported APIs", () => {
             proc.kill();
           } catch {}
         }
+      }
+    });
+  });
+
+  describe("Live Core ACP Driver Pool + Interactive Permission Modal Round-Trip", () => {
+    it("reuses persistent ACP subprocess across turns, switches model via session/set_model, handles permission_request modal, and closes process on session delete", async () => {
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-acp-home-"));
+      const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), "asd-nexus-acp-proj-"));
+      const mockAcpScript = path.join(tmpProject, "mock-acp-agent.mjs");
+
+      fs.writeFileSync(
+        mockAcpScript,
+        [
+          'import * as readline from "node:readline";',
+          "const rl = readline.createInterface({ input: process.stdin, terminal: false });",
+          'let currentModel = "claude-sonnet-4-6";',
+          "let nextRpcId = 900;",
+          "const pendingPerm = new Map();",
+          "function send(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }",
+          'rl.on("line", async (line) => {',
+          "  if (!line.trim()) return;",
+          "  const msg = JSON.parse(line);",
+          "  if (msg.id !== undefined && msg.method === undefined) {",
+          "    const res = pendingPerm.get(msg.id);",
+          "    if (res) { pendingPerm.delete(msg.id); res(msg.result); }",
+          "    return;",
+          "  }",
+          '  if (msg.method === "initialize") {',
+          "    send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });",
+          '  } else if (msg.method === "session/new") {',
+          "    send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_live_001', models: { availableModels: [{ modelId: 'claude-sonnet-4-6' }, { modelId: 'claude-opus-4-6' }], currentModelId: currentModel } } });",
+          '  } else if (msg.method === "session/set_model") {',
+          "    currentModel = msg.params.modelId;",
+          "    send({ jsonrpc: '2.0', id: msg.id, result: {} });",
+          '  } else if (msg.method === "session/prompt") {',
+          "    const promptText = msg.params?.prompt?.[0]?.text || '';",
+          "    if (promptText.includes('NEED_PERMISSION')) {",
+          "      const permId = nextRpcId++;",
+          "      const permRes = await new Promise((resolve) => {",
+          "        pendingPerm.set(permId, resolve);",
+          "        send({ jsonrpc: '2.0', id: permId, method: 'session/request_permission', params: {",
+          "          sessionId: 'acp_live_001',",
+          "          toolCall: { toolCallId: 'tc_1', title: 'write_file', kind: 'edit', rawInput: { path: 'hello.txt' }, locations: [{ path: 'hello.txt' }] },",
+          "          options: [",
+          "            { optionId: 'opt_allow_once', name: 'Allow Once', kind: 'allow_once' },",
+          "            { optionId: 'opt_reject_once', name: 'Reject', kind: 'reject_once' }",
+          "          ]",
+          "        }});",
+          "      });",
+          "      const picked = permRes?.outcome?.optionId || 'none';",
+          "      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'acp_live_001', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `pid=${process.pid};model=${currentModel};perm=${picked}` } } } });",
+          "    } else {",
+          "      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'acp_live_001', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `pid=${process.pid};model=${currentModel};perm=skipped` } } } });",
+          "    }",
+          "    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });",
+          "  }",
+          "});",
+        ].join("\n"),
+        "utf8"
+      );
+
+      sdk.ensureProjectInitialized(tmpProject, tmpHome);
+      const server = createOrchestratorApp(
+        {
+          runDriverTurn: (input) =>
+            sdk.runDriverTurn({
+              ...input,
+              transport: "acp",
+              acpCommandOverride: {
+                command: process.execPath,
+                args: [mockAcpScript],
+              },
+            }),
+        },
+        { defaultProjectRoot: tmpProject, homeDir: tmpHome }
+      );
+
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const port = (server.address() as AddressInfo).port;
+      const baseUrl = `http://127.0.0.1:${port}`;
+
+      try {
+        // 1. Create session with autoApprove: false
+        const createRes = await fetch(`${baseUrl}/api/sessions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            projectRoot: tmpProject,
+            harness: "claude-code",
+            model: "claude-sonnet-4-6",
+            autoApprove: false,
+            makeForeground: true,
+          }),
+        });
+        const created = (await createRes.json()) as CreateSessionResponse;
+        assert.equal(created.success, true);
+        assert.equal(created.autoApprove, false);
+        const sessionId = created.sessionId;
+
+        // 2. Turn 1: triggers live ACP session/request_permission -> SSE permission_request -> POST /api/turn/permission
+        const turn1Res = await fetch(`${baseUrl}/api/turn/stream`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+          },
+          body: JSON.stringify({
+            projectRoot: tmpProject,
+            sessionId,
+            harness: "claude-code",
+            model: "claude-sonnet-4-6",
+            prompt: "NEED_PERMISSION please edit hello.txt",
+          }),
+        });
+        assert.equal(turn1Res.status, 200);
+
+        const turn1Events: OrchestratorEvent[] = [];
+        const reader = turn1Res.body!.getReader();
+        const decoder = new TextDecoder();
+        let sseBuf = "";
+        let approvedSent = false;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          sseBuf += decoder.decode(value, { stream: true });
+          let idx = sseBuf.indexOf("\n\n");
+          while (idx !== -1) {
+            const block = sseBuf.slice(0, idx);
+            sseBuf = sseBuf.slice(idx + 2);
+            for (const line of block.split("\n")) {
+              if (line.startsWith("data: ")) {
+                const evt = JSON.parse(line.slice(6)) as OrchestratorEvent;
+                turn1Events.push(evt);
+                if (evt.kind === "permission_request" && !approvedSent) {
+                  approvedSent = true;
+                  const permResp = await fetch(`${baseUrl}/api/turn/permission`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      turnId: evt.turnId!,
+                      requestId: evt.permissionRequest!.requestId,
+                      outcome: "selected",
+                      optionId: "opt_allow_once",
+                    }),
+                  });
+                  const permJson = (await permResp.json()) as { success: boolean };
+                  assert.equal(permJson.success, true);
+                }
+              }
+            }
+            idx = sseBuf.indexOf("\n\n");
+          }
+        }
+
+        assert.equal(approvedSent, true, "Must emit SSE permission_request event");
+        const turn1Text = turn1Events
+          .filter((e) => e.kind === "text")
+          .map((e) => e.text)
+          .join("");
+        const pidMatch1 = /pid=(\d+);model=([^;]+);perm=([^\s]+)/.exec(turn1Text);
+        assert.ok(pidMatch1, `Unexpected Turn 1 text: ${turn1Text}`);
+        const acpPid = Number(pidMatch1[1]);
+        assert.equal(pidMatch1[2], "claude-sonnet-4-6");
+        assert.equal(pidMatch1[3], "opt_allow_once");
+
+        // 3. Turn 2: switch model to claude-opus-4-6 on the SAME locked session; must reuse SAME ACP pid
+        const turn2Res = await fetch(`${baseUrl}/api/turn/stream`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+          },
+          body: JSON.stringify({
+            projectRoot: tmpProject,
+            sessionId,
+            harness: "claude-code",
+            model: "claude-opus-4-6",
+            prompt: "Follow up without permission prompt",
+          }),
+        });
+        assert.equal(turn2Res.status, 200);
+        const turn2Raw = await turn2Res.text();
+        const turn2Events = turn2Raw
+          .split("\n\n")
+          .flatMap((b) => b.split("\n"))
+          .filter((l) => l.startsWith("data: "))
+          .map((l) => JSON.parse(l.slice(6)) as OrchestratorEvent);
+        const turn2Text = turn2Events
+          .filter((e) => e.kind === "text")
+          .map((e) => e.text)
+          .join("");
+        const pidMatch2 = /pid=(\d+);model=([^;]+);perm=([^\s]+)/.exec(turn2Text);
+        assert.ok(pidMatch2, `Unexpected Turn 2 text: ${turn2Text}`);
+        assert.equal(
+          Number(pidMatch2[1]),
+          acpPid,
+          "Turn 2 must reuse the persistent ACP child process PID"
+        );
+        assert.equal(
+          pidMatch2[2],
+          "claude-opus-4-6",
+          "Turn 2 must switch model via ACP session/set_model"
+        );
+
+        // 4. Delete session -> closeDriverSession terminates the persistent ACP child process
+        const delRes = await fetch(
+          `${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}?projectRoot=${encodeURIComponent(tmpProject)}`,
+          { method: "DELETE" }
+        );
+        const delJson = (await delRes.json()) as { success: boolean };
+        assert.equal(delJson.success, true);
+
+        // Verify ACP process is no longer alive
+        let alive = true;
+        for (let i = 0; i < 20; i++) {
+          try {
+            process.kill(acpPid, 0);
+            await new Promise((r) => setTimeout(r, 50));
+          } catch {
+            alive = false;
+            break;
+          }
+        }
+        assert.equal(alive, false, "Persistent ACP process must be terminated on session delete");
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await sdk.closeAllDriverSessions();
+        fs.rmSync(tmpProject, { recursive: true, force: true });
+        fs.rmSync(tmpHome, { recursive: true, force: true });
       }
     });
   });

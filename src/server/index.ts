@@ -4,7 +4,11 @@ import {
   SIDECAR_READY_PROTOCOL,
   type SidecarReadyInfo,
 } from "../shared/protocol.ts";
-import { assertSupportedAsdVersion, ASD_VERSION } from "./sdk.ts";
+import {
+  assertSupportedAsdVersion,
+  ASD_VERSION,
+  closeAllDriverSessions,
+} from "./sdk.ts";
 
 export interface ParsedCliArgs {
   port: number;
@@ -91,13 +95,17 @@ export function startSidecar(cliArgs: string[] = process.argv.slice(2)) {
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    server.close(() => {
-      process.exit(0);
-    });
     const forceTimer = setTimeout(() => {
       process.exit(0);
     }, 2000);
     forceTimer.unref();
+    void closeAllDriverSessions()
+      .catch(() => {})
+      .finally(() => {
+        server.close(() => {
+          process.exit(0);
+        });
+      });
   };
 
   process.on("SIGINT", shutdown);

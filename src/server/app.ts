@@ -134,7 +134,10 @@ export interface OrchestratorDeps {
     sessionId: string,
     options?: sdk.ReadTranscriptOptions
   ) => sdk.HarnessTranscript;
-  runDriverTurn: (input: any) => Promise<sdk.DriverRunResult>;
+  runDriverTurn: (input: sdk.RunDriverTurnInput) => Promise<sdk.DriverRunResult>;
+  cancelDriverTurn: (sessionId: string) => boolean;
+  closeDriverSession: (sessionId: string) => Promise<void>;
+  closeAllDriverSessions: () => Promise<void>;
   collectDashboardSnapshot: (options?: {
     projectRoot?: string;
     homeDir?: string;
@@ -189,6 +192,9 @@ export function createDefaultDeps(): OrchestratorDeps {
     buildResumeCommand: sdk.buildResumeCommand,
     readHarnessTranscript: sdk.readHarnessTranscript,
     runDriverTurn: sdk.runDriverTurn,
+    cancelDriverTurn: sdk.cancelDriverTurn,
+    closeDriverSession: sdk.closeDriverSession,
+    closeAllDriverSessions: sdk.closeAllDriverSessions,
     collectDashboardSnapshot: sdk.collectDashboardSnapshot,
     syncPlanFromMd: sdk.syncPlanFromMd,
     handlePlan: sdk.handlePlan,
@@ -297,15 +303,15 @@ async function matchAndDispatchRoute(ctx: RequestContext): Promise<void> {
     return;
   }
   if (method === "POST" && path === "/api/sessions/demote") {
-    demoteSessionRoute(ctx);
+    await demoteSessionRoute(ctx);
     return;
   }
   if (method === "POST" && path === "/api/sessions/unlink") {
-    unlinkSessionRoute(ctx);
+    await unlinkSessionRoute(ctx);
     return;
   }
   if (method === "POST" && path === "/api/sessions/delete") {
-    deleteSessionRoute(ctx);
+    await deleteSessionRoute(ctx);
     return;
   }
   if (method === "POST" && path === "/api/sessions/memo") {
@@ -406,7 +412,7 @@ async function matchAndDispatchRoute(ctx: RequestContext): Promise<void> {
 
   const deleteMatch = path.match(/^\/api\/sessions\/([^/]+)$/);
   if (method === "DELETE" && deleteMatch?.[1]) {
-    deleteSessionRoute(ctx, decodeURIComponent(deleteMatch[1]));
+    await deleteSessionRoute(ctx, decodeURIComponent(deleteMatch[1]));
     return;
   }
 
@@ -529,6 +535,7 @@ export function createOrchestratorApp(
 
   server.on("close", () => {
     cancelAllActiveTurns();
+    void fullDeps.closeAllDriverSessions?.().catch(() => {});
   });
 
   return server;

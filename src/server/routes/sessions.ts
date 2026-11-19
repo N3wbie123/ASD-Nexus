@@ -169,10 +169,13 @@ export function promoteSessionRoute(ctx: RequestContext): void {
   }
 }
 
-export function demoteSessionRoute(ctx: RequestContext): void {
+export async function demoteSessionRoute(ctx: RequestContext): Promise<void> {
   const projectRoot = ctx.body?.projectRoot || ctx.projectRoot;
   const sessionId = ctx.body?.sessionId;
   try {
+    if (sessionId) {
+      await ctx.deps.closeDriverSession?.(sessionId).catch(() => {});
+    }
     const res = ctx.deps.buildSessionDemotion({
       projectRoot,
       sessionId,
@@ -191,11 +194,14 @@ export function demoteSessionRoute(ctx: RequestContext): void {
   }
 }
 
-export function unlinkSessionRoute(ctx: RequestContext): void {
+export async function unlinkSessionRoute(ctx: RequestContext): Promise<void> {
   const projectRoot = ctx.body?.projectRoot || ctx.projectRoot;
   const asdSessionId = ctx.body?.asdSessionId;
   const deleteAsdSession = Boolean(ctx.body?.deleteAsdSession);
   try {
+    if (asdSessionId) {
+      await ctx.deps.closeDriverSession?.(asdSessionId).catch(() => {});
+    }
     ctx.deps.unlinkHarnessSessionFromAsdSession({
       projectRoot,
       asdSessionId,
@@ -212,7 +218,10 @@ export function unlinkSessionRoute(ctx: RequestContext): void {
   }
 }
 
-export function deleteSessionRoute(ctx: RequestContext, paramSessionId?: string): void {
+export async function deleteSessionRoute(
+  ctx: RequestContext,
+  paramSessionId?: string
+): Promise<void> {
   const projectRoot =
     ctx.body?.projectRoot || ctx.query.get("projectRoot") || ctx.projectRoot;
   const sessionId = paramSessionId || ctx.body?.sessionId;
@@ -225,6 +234,7 @@ export function deleteSessionRoute(ctx: RequestContext, paramSessionId?: string)
   }
 
   try {
+    await ctx.deps.closeDriverSession?.(sessionId).catch(() => {});
     ctx.deps.unlinkHarnessSessionFromAsdSession({
       projectRoot,
       asdSessionId: sessionId,

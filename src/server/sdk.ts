@@ -20,6 +20,10 @@ import {
   buildResumeHarnessCommand,
   buildSessionDemotion,
   buildSpawnSpec,
+  cancelDriverTurn,
+  closeAllDriverSessions,
+  closeDriverSession,
+  closeDriverSessionByDriverId,
   collectDashboardSnapshot,
   detachDriver,
   discoverHarnessModels,
@@ -57,11 +61,14 @@ import {
 } from "agent-swarm-director";
 
 import type {
+  AcpRequestPermissionParams,
+  AcpRequestPermissionResult,
   AsdPaths,
   CliRecentSessionEntry,
   DashboardSnapshot,
   DriverRow,
   DriverRunResult,
+  DriverSessionPoolEntry,
   DriverStreamEvent,
   DriverStreamEventType,
   HarnessId,
@@ -74,6 +81,7 @@ import type {
   PromoteCliSessionResult,
   ReadTranscriptOptions,
   RoutingConfig,
+  RunDriverTurnInput,
   SessionDemotionResult,
   SessionRow,
   SqliteDriver,
@@ -110,8 +118,12 @@ export {
   buildHeadlessHarnessCommand,
   buildResumeHarnessCommand,
   buildInteractiveResumeHarnessCommand,
-  // streaming turns & stream parser
+  // streaming turns, ACP session pool lifecycle & stream parser
   runDriverTurn,
+  cancelDriverTurn,
+  closeDriverSession,
+  closeDriverSessionByDriverId,
+  closeAllDriverSessions,
   parseDriverStreamLine,
   // driver registry
   attachDriver,
@@ -152,11 +164,14 @@ export {
 // ============================================================================
 
 export type {
+  AcpRequestPermissionParams,
+  AcpRequestPermissionResult,
   AsdPaths,
   CliRecentSessionEntry,
   DashboardSnapshot,
   DriverRow,
   DriverRunResult,
+  DriverSessionPoolEntry,
   DriverStreamEvent,
   DriverStreamEventType,
   HarnessId,
@@ -169,6 +184,7 @@ export type {
   PromoteCliSessionResult,
   ReadTranscriptOptions,
   RoutingConfig,
+  RunDriverTurnInput,
   SessionDemotionResult,
   SessionRow,
   SqliteDriver,

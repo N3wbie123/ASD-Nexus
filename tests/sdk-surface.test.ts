@@ -8,6 +8,10 @@ import {
   assertSupportedAsdVersion,
   buildResumeCommand,
   buildSpawnSpec,
+  cancelDriverTurn,
+  closeAllDriverSessions,
+  closeDriverSession,
+  closeDriverSessionByDriverId,
   compareAsdVersions,
   isSupportedAsdVersion,
   withReadOnlyProjectDb,
@@ -239,6 +243,16 @@ describe("ASD v2.6.0+ SDK Surface & Boundary Contract", () => {
 
       assert.ok(Array.isArray(result), "Callback should return session rows array");
       assert.equal(closed, true, "Database connection must be closed in finally block");
+    });
+    it("exports ACP driver session pool lifecycle controls", async () => {
+      assert.equal(typeof cancelDriverTurn, "function");
+      assert.equal(typeof closeDriverSession, "function");
+      assert.equal(typeof closeDriverSessionByDriverId, "function");
+      assert.equal(typeof closeAllDriverSessions, "function");
+      assert.equal(cancelDriverTurn("asd-nonexistent"), false);
+      await closeDriverSession("asd-nonexistent");
+      await closeDriverSessionByDriverId("drv-nonexistent");
+      await closeAllDriverSessions();
     });
   });
 });

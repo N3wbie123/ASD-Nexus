@@ -12,7 +12,7 @@
   - **Server-Side Harness Immutability (`turns.ts`)**: Started/existing ASD sessions reject cross-harness turn requests with `HARNESS_IMMUTABLE` (preserving `lockedHarness` and `harness_session_id`), and raw native CLI `sessionId` requests check `db.listSessions?.()` / `findSessionByHarnessSessionId` to reject cross-harness mismatches with `HARNESS_IMMUTABLE` rather than creating duplicate sessions.
   - **Live Same-Harness Model Switching & Default Reset (`turns.ts`)**: Same-harness model updates attach cleanly while preserving `harness_session_id`; explicit `model: "default"` or `""` resets `session_drivers.model` and `sessions.main_model` to `null` and passes `undefined` into `runDriverTurn`.
   - **`autoApprove` Persistence & Interactive Permission Broker (`sessions.ts`, `turns.ts`)**: `POST /api/sessions` and `POST /api/sessions/auto-approve` persist `auto_approve` in SQLite. When `autoApprove` is `false`, `runDriverTurn` tool permission requests emit SSE `permission_request` events and block until `POST /api/turn/permission` resolves (`selected` / `cancelled`). Choosing `allow_always` (including empty-options fallback `optionId === "allow_always"`) updates `turn.autoApprove = true` and persists `auto_approve = 1` in SQLite.
-  - **Core Runtime ACP Wiring Note**: Live harness subprocess ACP permission wiring awaits `docs/CORE_CHANGE_REQUEST_ACP_DRIVER.md` in `asd-multiagent`.
+  - **Core Runtime ACP Integration (`sdk.ts`, `app.ts`, `index.ts`, `sessions.ts`, `turns.ts`)**: Wired to ASD Core v2.7.0 `CR-ACP-DRIVER` (`c795d22`, `7e1b42c`, `1dccb52`). `runDriverTurn` runs persistent ACP sessions (`transport: "auto"` with streaming CLI fallback when external bridges are absent), supports live `session/set_model` model switching and `onPermissionRequest` interactive permission modal round-trips, calls cooperative `cancelDriverTurn` (`session/cancel`) on turn cancel, closes pooled ACP sessions via `closeDriverSession` on session demote/unlink/delete, and drains `closeAllDriverSessions` on sidecar shutdown.
 - **CLI / TUI (`native/asd-nexus-cli`)**:
   - Borderless OpenCode-inspired TUI with `DarkColor` default + strict grayscale `Monochrome` toggle, `/` command & `@` file popups, `Ctrl+P` palette, new-session-only harness picker + read-only started-session harness badge with live model switching, `/auto-approve` toggle, and interactive `PERMISSION APPROVAL` modal (`y` / `a` / `n` / `Esc` / arrow selection, plus `Ctrl+X` turn abort).
 - **Desktop GUI (`native/asd-nexus-desktop`)**:
@@ -32,11 +32,11 @@
 ## 3. Node Offline & Server Checks
 
 - **`npm run typecheck`** (`tsc --noEmit`): exit code `0` (`0` errors).
-- **Offline Test Suites** (`node --no-warnings --test tests/normalizer-replay.test.ts tests/sdk-surface.test.ts tests/server-api.test.ts tests/model-catalog.test.ts`): **80 passed, 0 failed, 0 skipped** across **24 suites** in `1,996.2 ms`:
+- **Offline & Live ACP Subprocess Test Suites** (`node --no-warnings --test tests/normalizer-replay.test.ts tests/sdk-surface.test.ts tests/server-api.test.ts tests/model-catalog.test.ts`): **82 passed, 0 failed, 0 skipped** across **25 suites**:
   - Replays 10 NDJSON fixtures across all 5 harnesses plus 7-byte chunk-boundary equivalence.
   - Verifies model catalog merge behavior across partial refreshes.
-  - Enforces v2.6.0+ SDK boundary cleanliness across `src/` (`0` `child_process` imports).
-  - Verifies HTTP auth, project/session/board/plan/routing/worktree/subagent/terminal routes, `/api/harness-commands`, `/api/fs/list`, SQLite active driver attachment + Turn 2 `harnessSessionId` preservation, `HARNESS_IMMUTABLE` (ASD ID & raw CLI `sessionId`), explicit `"default"` model reset, `autoApprove` persistence, interactive permission brokering (including empty-options `allow_always` fallback), and real child sidecar `--port 0` EOF termination.
+  - Enforces v2.6.0+ SDK boundary cleanliness across `src/` (`0` `child_process` imports) and verifies `cancelDriverTurn` / `closeDriverSession` / `closeDriverSessionByDriverId` / `closeAllDriverSessions` exports.
+  - Verifies HTTP auth, project/session/board/plan/routing/worktree/subagent/terminal routes, `/api/harness-commands`, `/api/fs/list`, SQLite active driver attachment + Turn 2 `harnessSessionId` preservation, `HARNESS_IMMUTABLE` (ASD ID & raw CLI `sessionId`), explicit `"default"` model reset, `autoApprove` persistence, interactive permission brokering, real child sidecar `--port 0` EOF termination, and **live `sdk.runDriverTurn` persistent ACP subprocess PID reuse + `session/set_model` + `session/request_permission` SSE modal approval + `DELETE /api/sessions/:id` process teardown**.
 
 ## 4. Native Rust Locked Test & Release Build Results
 
