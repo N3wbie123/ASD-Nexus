@@ -318,7 +318,7 @@ impl App {
             prompt: None,
             confirm: None,
             pending: vec![Action::LoadInitial],
-            status: "Ready · / commands · @ files · ! shell · Ctrl+P palette".into(),
+            status: String::new(),
             should_quit: false,
             projects: vec![],
             project_sel: 0,
@@ -848,11 +848,11 @@ impl App {
             self.timeline_scroll = None;
         }
         if closed || !self.timeline.streaming {
-            self.timeline.end_turn(Some("stream closed"));
+            self.timeline.end_turn(None);
             self.stream = None;
             self.pending_permissions.clear();
             self.permission_sel = 0;
-            self.set_status("Turn finished");
+            self.set_status("");
         }
     }
 

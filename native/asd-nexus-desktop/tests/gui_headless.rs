@@ -9,7 +9,7 @@
 //!   and clipboard copy.
 
 use asd_nexus_client::*;
-use asd_nexus_desktop::app::{ConnState, NexusApp, PaletteAction, RunOptions};
+use asd_nexus_desktop::app::{is_thinking_open, thinking_card_rect, ConnState, NexusApp, PaletteAction, RunOptions};
 use asd_nexus_desktop::backend::{Reply, Request, SavePlanOutcome};
 use asd_nexus_desktop::state::{PrimaryMode, Tab};
 use asd_nexus_desktop::theme::{self, ThemeMode};
@@ -648,10 +648,11 @@ fn command_palette_modal_renders_and_executes_actions() {
     let _ = frame(&ctx, &mut app, vec![ctrl_p]);
     assert!(app.palette_open);
 
-    // Render palette modal and verify entries
+    // Render palette modal and verify entries (only current Workspace open action, no multi-project dump)
     let _ = frame(&ctx, &mut app, vec![]);
     let entries = app.build_palette_entries();
-    assert!(entries.iter().any(|e| e.category == "Project"));
+    assert_eq!(entries.iter().filter(|e| e.category == "Workspace").count(), 1);
+    assert!(!entries.iter().any(|e| e.category == "Project"));
     assert!(entries.iter().any(|e| e.category == "Harness"));
     assert!(entries.iter().any(|e| e.category == "Command"));
 
@@ -888,6 +889,169 @@ fn composer_enter_sends_and_shift_enter_inserts_newline() {
         app.status
     );
     assert_eq!(app.chat.composer, "hello\n", "prompt kept when send fails");
+}
+
+#[test]
+fn thinking_card_toggles_when_clicked_anywhere() {
+    let ctx = ctx();
+    let mut app = NexusApp::new("C:/p", RunOptions::default());
+    app.chat.timeline.begin_turn("explain");
+    app.chat.timeline.push(
+        EntryKind::Thinking,
+        "",
+        "line 1 of thought\nline 2 of thought\nline 3 of thought\nline 4 of thought",
+    );
+    let think_id = app.chat.timeline.entries[1].id;
+
+    let _ = frame(&ctx, &mut app, vec![]);
+    assert!(!is_thinking_open(&ctx, think_id));
+    let rect = thinking_card_rect(&ctx, think_id).expect("thinking card rect");
+
+    let click_at = |ctx: &egui::Context, app: &mut NexusApp, pos: egui::Pos2| {
+        let _ = frame(
+            ctx,
+            app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = frame(
+            ctx,
+            app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        // Settle repaint frame so expanded/collapsed layout rect updates
+        let _ = frame(ctx, app, vec![]);
+    };
+
+    // 1. Click far-right empty area of Thinking header -> expands
+    click_at(&ctx, &mut app, egui::pos2(rect.max.x - 12.0, rect.center().y));
+    assert!(is_thinking_open(&ctx, think_id), "clicking right margin of Thinking must expand");
+
+    // 2. Click inside expanded Thinking body -> collapses
+    let open_rect = thinking_card_rect(&ctx, think_id).unwrap();
+    assert!(open_rect.height() > rect.height(), "expanded Thinking card must grow taller");
+    click_at(&ctx, &mut app, egui::pos2(open_rect.center().x, open_rect.max.y - 8.0));
+    assert!(!is_thinking_open(&ctx, think_id), "clicking expanded body of Thinking must collapse");
+
+    // 3. Click center text of collapsed Thinking header -> expands again
+    let closed_rect = thinking_card_rect(&ctx, think_id).unwrap();
+    click_at(&ctx, &mut app, closed_rect.center());
+    assert!(is_thinking_open(&ctx, think_id), "clicking center label of Thinking must expand");
+}
+
+#[test]
+fn switching_sessions_or_new_chat_preserves_running_stream() {
+    let ctx = ctx();
+    let mut app = NexusApp::new("C:/p", RunOptions::default());
+    populate(&mut app);
+    app.chat.turn_seq = None;
+    app.chat.timeline.clear();
+    app.backend.set_client(Some(NexusClient::new("http://127.0.0.1:9", None)));
+
+    // 1. Select Session 0 (asd-1 / cc-111) and start a streaming turn
+    app.select_session(0);
+    app.backend.submitted.clear();
+    app.chat.composer = "지금은 어느 모델이야?".into();
+    app.send_prompt();
+    let seq_a = app.chat.turn_seq.expect("Session 0 turn must be streaming");
+    assert!(app.chat.is_streaming());
+
+    // 2. While Session 0 is streaming, switch to Session 1 (cx-222) to check it
+    app.select_session(1);
+    assert!(
+        !app.backend.submitted.iter().any(|r| matches!(r, Request::CancelTurn(_))),
+        "switching sessions must NEVER cancel the running turn"
+    );
+    assert!(!app.chat.is_streaming(), "Session 1 itself is not streaming");
+    assert!(app.has_running_background_turns(), "Session 0 keeps streaming in background");
+
+    // Session 1's transcript loads cleanly without touching Session 0
+    app.handle_reply(Reply::Transcript(Ok(GetTranscriptResponse {
+        harness: "codex".into(),
+        harness_session_id: "cx-222".into(),
+        transcript_path: None,
+        messages: vec![NormalizedTranscriptMessage {
+            role: "assistant".into(),
+            category: Some(TranscriptCategory::Assistant),
+            text: "codex history message".into(),
+            thinking: None,
+            tool_name: None,
+            tool_use: None,
+            tool_result: None,
+            timestamp: None,
+        }],
+        has_more: None,
+        truncated: None,
+        error: None,
+    })));
+    assert_eq!(app.chat.timeline.entries.len(), 1);
+    assert_eq!(app.chat.timeline.entries[0].body, "codex history message");
+
+    // Meanwhile Session 0 receives SSE chunks in the background
+    app.handle_reply(Reply::Stream {
+        seq: seq_a,
+        msg: ev(r#"{"kind":"thinking","thinking":"checking model"}"#),
+    });
+    app.handle_reply(Reply::Stream {
+        seq: seq_a,
+        msg: ev(r#"{"kind":"text","text":"현재 Gemini 4 "}"#),
+    });
+
+    // Render sidebar with RUNNING badge in both DarkColor & Monochrome
+    let _ = frame(&ctx, &mut app, vec![]);
+    app.set_theme_mode(&ctx, ThemeMode::Monochrome);
+    let mono_out = frame(&ctx, &mut app, vec![]);
+    assert!(assert_grayscale_output(&ctx, mono_out) > 100);
+    app.set_theme_mode(&ctx, ThemeMode::DarkColor);
+
+    // 3. Switch back to Session 0 while it is STILL streaming -> live stream reattaches!
+    app.select_session(0);
+    assert!(app.chat.is_streaming(), "reselecting Session 0 must reattach live stream");
+    assert_eq!(app.chat.turn_seq, Some(seq_a));
+    assert!(app.chat.timeline.entries.iter().any(|e| e.body == "지금은 어느 모델이야?"));
+    assert!(app.chat.timeline.entries.iter().any(|e| e.body == "현재 Gemini 4 "));
+
+    // 4. Click `+ New Chat` while Session 0 is still streaming -> parks instead of cancelling!
+    app.backend.submitted.clear();
+    app.start_new_session_draft();
+    assert!(
+        !app.backend.submitted.iter().any(|r| matches!(r, Request::CancelTurn(_))),
+        "+ New Chat must NEVER cancel a running turn in another session"
+    );
+    assert!(!app.chat.is_streaming());
+    assert!(app.has_running_background_turns());
+
+    // Session 0 finishes its answer while user is on `+ New Chat`
+    app.handle_reply(Reply::Stream {
+        seq: seq_a,
+        msg: ev(r#"{"kind":"text","text":"Neon 모델입니다."}"#),
+    });
+    app.handle_reply(Reply::Stream { seq: seq_a, msg: StreamMessage::Done });
+    assert!(!app.has_running_background_turns());
+
+    // 5. Reselect Session 0 -> full completed answer is immediately present!
+    app.select_session(0);
+    assert!(!app.chat.is_streaming());
+    assert!(
+        app.chat
+            .timeline
+            .entries
+            .iter()
+            .any(|e| e.kind == EntryKind::Text && e.body == "현재 Gemini 4 Neon 모델입니다."),
+        "completed background answer must be preserved when returning to Session 0"
+    );
 }
 
 trait OfflineCheck {

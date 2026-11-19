@@ -148,7 +148,7 @@ impl Timeline {
     /// Reduce one SSE stream message into the timeline.
     pub fn apply(&mut self, msg: &StreamMessage) {
         match msg {
-            StreamMessage::Done => self.end_turn(Some("turn complete")),
+            StreamMessage::Done => self.end_turn(None),
             StreamMessage::Error(e) => self.push(Entry::new(EntryKind::Error, e.clone())),
             StreamMessage::Event(evt) => {
                 if self.turn_id.is_none() {
@@ -209,7 +209,7 @@ impl Timeline {
                     }
                 }
                 match evt.status {
-                    Some(OrchestratorTurnStatus::Done) => self.end_turn(Some("turn complete")),
+                    Some(OrchestratorTurnStatus::Done) => self.end_turn(None),
                     Some(OrchestratorTurnStatus::Interrupted) => self.end_turn(Some("turn interrupted")),
                     _ => {}
                 }
@@ -352,7 +352,6 @@ mod tests {
                 EntryKind::ToolUse,
                 EntryKind::ToolResult,
                 EntryKind::Text,
-                EntryKind::System
             ]
         );
         assert_eq!(t.entries[1].body, "plan more");
@@ -372,7 +371,8 @@ mod tests {
         t.apply(&StreamMessage::Error("bad".into()));
         t.apply(&StreamMessage::Done);
         t.apply(&StreamMessage::Done);
-        assert_eq!(t.entries.iter().filter(|e| e.kind == EntryKind::System).count(), 1);
+        assert!(!t.streaming);
+        assert_eq!(t.entries.len(), 2);
         assert_eq!(t.entries[1].kind, EntryKind::Error);
     }
 

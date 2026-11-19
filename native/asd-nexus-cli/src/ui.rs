@@ -12,7 +12,7 @@ use crate::app::{
     terminal_name, App, BoardPane, CommandBadge, Focus, Overlay, UiRegions, HARNESSES, TERMINALS,
 };
 use crate::theme;
-use crate::timeline::{Entry, EntryKind};
+use crate::timeline::EntryKind;
 
 const SPINNER: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
 
@@ -96,8 +96,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     f.render_widget(Block::default().style(theme::base()), area);
 
-    let [head, body, foot] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)]).areas(area);
+    let [head, _top_gap, body, foot] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(5),
+        Constraint::Length(1),
+    ])
+    .areas(area);
     draw_header(f, head, app);
 
     let main_area = if app.sidebar_open {
@@ -115,8 +120,12 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else {
         let input_lines = app.input_area.lines.len().clamp(1, 6) as u16;
         let input_h = (input_lines + 3).min(main_area.height.saturating_sub(3)).max(3);
-        let [tl_area, input_area] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(input_h)]).areas(main_area);
+        let [tl_area, _gap, input_area] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(input_h),
+        ])
+        .areas(main_area);
         draw_timeline(f, tl_area, app);
         draw_input_card(f, input_area, app);
         draw_input_popups(f, main_area, input_area, app);
@@ -169,60 +178,60 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let sess_summary = app
-        .current
-        .as_ref()
-        .and_then(|s| s.summary.as_deref())
-        .map(|s| first_line(s, 28))
-        .or_else(|| app.active_session_id().map(|id| short(&id, 20)))
-        .unwrap_or_else(|| "new".into());
-
-    let state = if app.is_streaming() {
-        format!(" {} STREAMING ", SPINNER[(app.timeline.entries.len()) % 4])
-    } else {
-        " IDLE ".into()
-    };
-
     let t = app.timeline.turn_usage;
     let s = app.timeline.total_usage;
     let tok_total = if s.total > 0 { s.total } else { t.input + t.output };
     let cost_total = if s.cost > 0.0 { s.cost } else { t.cost };
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(" ASD-NEXUS ", theme::badge()),
-        Span::styled(format!(" {} ", app.project_root), theme::header()),
-        Span::styled(format!("({}) ", sess_summary), theme::header_muted()),
-        Span::styled(
-            format!("· {} / {} ", app.harness, app.model.as_deref().unwrap_or("(default)")),
-            theme::header(),
-        ),
-        Span::styled(
-            format!("· TOKENS {} (${:.4}) ", fmt_num(tok_total), cost_total),
+        Span::styled(format!("  {}", app.project_root), theme::header()),
+    ];
+
+    if app.is_session_started() {
+        let sess_summary = app
+            .current
+            .as_ref()
+            .and_then(|s| s.summary.as_deref())
+            .map(|s| first_line(s, 28))
+            .or_else(|| app.active_session_id().map(|id| short(&id, 20)));
+        if let Some(summary) = sess_summary {
+            spans.push(Span::styled(format!("  ({summary})"), theme::header_muted()));
+        }
+    }
+
+    if tok_total > 0 {
+        spans.push(Span::styled(
+            format!("  ·  {} tok (${:.4})", fmt_num(tok_total), cost_total),
             theme::header_muted(),
-        ),
-        Span::styled(state, if app.is_streaming() { theme::badge() } else { theme::header() }),
-    ]);
-    f.render_widget(Paragraph::new(line).style(theme::header()), area);
+        ));
+    }
+
+    if app.is_streaming() {
+        let spin = SPINNER[(app.timeline.entries.len()) % 4];
+        spans.push(Span::styled("  ", theme::header()));
+        spans.push(Span::styled(format!(" {spin} STREAMING "), theme::badge()));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)).style(theme::header()), area);
 }
 
 fn draw_home(f: &mut Frame, area: Rect, app: &App) {
-    let card_w = area.width.saturating_sub(8).clamp(36, 96);
+    let card_w = area.width.saturating_sub(8).clamp(36, 88);
     let pad_x = area.width.saturating_sub(card_w) / 2;
     let center_col = Rect::new(area.x + pad_x, area.y, card_w, area.height);
 
     let input_lines = app.input_area.lines.len().clamp(1, 5) as u16;
-    let input_h = input_lines + 3;
+    let input_h = (input_lines + 3).min(area.height.saturating_sub(4)).max(3);
 
-    let [_top_sp, hero_area, card_area, tips_area, _bot_sp] = Layout::vertical([
+    let [_top_sp, hero_area, card_area, _bot_sp] = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(6),
+        Constraint::Length(3),
         Constraint::Length(input_h),
-        Constraint::Length(5),
         Constraint::Min(1),
     ])
     .areas(center_col);
 
-    let sess_label = app.active_session_id().unwrap_or_else(|| "none (auto-created on prompt)".into());
     let hero = vec![
         Line::from(vec![
             Span::styled("▄▀█ █▀ █▀▄   ", theme::accent()),
@@ -232,12 +241,6 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
             Span::styled("█▀█ ▄█ █▄▀   ", theme::accent()),
             Span::styled("█░▀█ ██▄ █░█ █▄█ ▄█", theme::bold()),
         ]),
-        Line::styled("Autonomous Multi-Harness Workspace · OpenCode UX", theme::muted()),
-        Line::from(vec![
-            Span::styled(format!("cwd: {} ", app.project_root), theme::faint()),
-            Span::styled(format!("· session: {} ", short(&sess_label, 24)), theme::faint()),
-            Span::styled(format!("· theme: {}", app.theme_mode.name()), theme::faint()),
-        ]),
         Line::raw(""),
     ];
     f.render_widget(
@@ -246,40 +249,11 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
     );
 
     draw_input_card(f, card_area, app);
-
-    let tips = vec![
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled(" /sessions ", theme::surface_accent()),
-            Span::styled(" sessions  ", theme::muted()),
-            Span::styled(" /models ", theme::surface_accent()),
-            Span::styled(" harness & model  ", theme::muted()),
-            Span::styled(" /cd ", theme::surface_accent()),
-            Span::styled(" switch dir  ", theme::muted()),
-            Span::styled(" Ctrl+P ", theme::surface_accent()),
-            Span::styled(" palette", theme::muted()),
-        ]),
-        Line::from(vec![
-            Span::styled(" @file ", theme::surface_accent()),
-            Span::styled(" attach file  ", theme::muted()),
-            Span::styled(" !cmd ", theme::surface_accent()),
-            Span::styled(" run shell  ", theme::muted()),
-            Span::styled(" Tab ", theme::surface_accent()),
-            Span::styled(" cycle harness  ", theme::muted()),
-            Span::styled(" /theme ", theme::surface_accent()),
-            Span::styled(" dark/mono", theme::muted()),
-        ]),
-    ];
-    f.render_widget(
-        Paragraph::new(tips).alignment(Alignment::Center).style(theme::base()),
-        tips_area,
-    );
-
     draw_input_popups(f, area, card_area, app);
 }
 
 fn draw_input_card(f: &mut Frame, area: Rect, app: &App) {
-    let pad = if area.width > 80 && !app.is_home() { 2 } else { 0 };
+    let pad = if !app.is_home() && area.width > 44 { 2 } else { 0 };
     let card = Rect::new(
         area.x + pad,
         area.y,
@@ -298,19 +272,27 @@ fn draw_input_card(f: &mut Frame, area: Rect, app: &App) {
     let bar = if focused { "┃ " } else { "│ " };
     let bar_style = if focused { theme::surface_accent() } else { theme::surface_faint() };
 
-    let text_rows = card.height.saturating_sub(1).max(1) as usize;
+    let h = card.height as usize;
+    let has_vpad = h >= 4;
+    let text_rows = if has_vpad {
+        h - 3
+    } else {
+        h.saturating_sub(1).max(1)
+    };
+
     let total_lines = app.input_area.lines.len();
     let start_row = app.input_area.row.saturating_sub(text_rows.saturating_sub(1));
 
-    let mut rendered_lines: Vec<Line> = Vec::new();
+    let mut rendered_lines: Vec<Line> = Vec::with_capacity(h);
+    if has_vpad {
+        rendered_lines.push(Line::from(vec![Span::styled(bar, bar_style)]));
+    }
+
     let is_empty = app.input.is_empty() && total_lines == 1 && app.input_area.lines[0].is_empty();
+    let mut pushed_text = 0usize;
 
     if is_empty {
-        let placeholder = if app.is_streaming() {
-            "Streaming turn… (Ctrl+X to cancel)"
-        } else {
-            "Ask anything…  (/ commands · @ files · ! shell · Shift+Enter newline)"
-        };
+        let placeholder = if app.is_streaming() { "Streaming…" } else { "Ask anything…" };
         let mut spans = vec![Span::styled(bar, bar_style), Span::styled("› ", theme::surface_accent())];
         if focused {
             spans.push(Span::styled("█", theme::surface_accent()));
@@ -319,9 +301,7 @@ fn draw_input_card(f: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::styled(placeholder, theme::surface_faint()));
         }
         rendered_lines.push(Line::from(spans));
-        for _ in 1..text_rows.saturating_sub(1) {
-            rendered_lines.push(Line::from(vec![Span::styled(bar, bar_style)]));
-        }
+        pushed_text += 1;
     } else {
         for (r, line_str) in app.input_area.lines.iter().enumerate().skip(start_row).take(text_rows) {
             let prefix = if r == 0 { "› " } else { "  " };
@@ -339,28 +319,33 @@ fn draw_input_card(f: &mut Frame, area: Rect, app: &App) {
                 spans.push(Span::styled(line_str.clone(), theme::surface()));
             }
             rendered_lines.push(Line::from(spans));
+            pushed_text += 1;
         }
     }
 
-    // Status pill row at the bottom of the input card
-    let auto_label = if app.auto_approve { "[auto:on]" } else { "[auto:off]" };
-    let auto_style = if app.auto_approve { theme::surface_muted() } else { theme::badge() };
-    let tab_hint = if app.is_session_started() { "" } else { " · Tab switch harness" };
-    let pill = Line::from(vec![
-        Span::styled(bar, bar_style),
-        Span::styled(format!(" {} ", app.harness), theme::harness_badge()),
-        Span::styled(
-            format!(" · {} ", app.model.as_deref().unwrap_or("(default)")),
-            theme::surface_muted(),
-        ),
-        Span::styled(format!(" {auto_label} "), auto_style),
-        Span::styled(format!("· {} ", short(&app.project_root, 34)), theme::surface_faint()),
-        Span::styled(
-            format!(" · Enter send · Shift+Enter newline{tab_hint} · / cmd · @ file · ! shell"),
-            theme::surface_faint(),
-        ),
-    ]);
-    rendered_lines.push(pill);
+    while pushed_text < text_rows {
+        rendered_lines.push(Line::from(vec![Span::styled(bar, bar_style)]));
+        pushed_text += 1;
+    }
+
+    if h >= 2 {
+        let auto_label = if app.auto_approve { "[auto:on]" } else { "[auto:off]" };
+        let auto_style = if app.auto_approve { theme::surface_faint() } else { theme::badge() };
+        let pill = Line::from(vec![
+            Span::styled(bar, bar_style),
+            Span::styled(format!(" {} ", app.harness), theme::harness_badge()),
+            Span::styled(
+                format!(" · {} ", app.model.as_deref().unwrap_or("(default)")),
+                theme::surface_muted(),
+            ),
+            Span::styled(format!(" {auto_label}"), auto_style),
+        ]);
+        rendered_lines.push(pill);
+    }
+
+    if has_vpad {
+        rendered_lines.push(Line::from(vec![Span::styled(bar, bar_style)]));
+    }
 
     f.render_widget(Paragraph::new(rendered_lines).style(theme::surface()), card);
 }
@@ -502,75 +487,125 @@ pub fn timeline_lines(app: &App, width: usize, focused: bool) -> (Vec<Line<'stat
     for (i, e) in app.timeline.entries.iter().enumerate() {
         starts.push(lines.len());
         let sel = focused && i == app.timeline_sel;
-        let (head, bar_style, body_style) = entry_header(app, i, e);
-        let head_style = if sel { theme::selected() } else { theme::bold() };
-        let mut spans: Vec<Span> = vec![Span::styled("┃ ", if sel { head_style } else { bar_style })];
-        for (txt, st) in head {
-            spans.push(Span::styled(txt, if sel { head_style } else { st }));
-        }
-        lines.push(Line::from(spans));
-        let body: Option<String> = if e.kind.collapsible() && e.collapsed {
-            let p = first_line(&e.body, width.saturating_sub(8));
-            (!p.is_empty()).then_some(p)
-        } else if e.body.is_empty() {
-            None
-        } else {
-            Some(e.body.clone())
-        };
-        if let Some(b) = body {
-            for l in wrap(&b, width.saturating_sub(5)) {
-                lines.push(Line::from(vec![
-                    Span::styled("┃ ", bar_style),
-                    Span::styled(format!("  {l}"), body_style),
-                ]));
+
+        match e.kind {
+            EntryKind::User => {
+                // Only User messages have the left vertical bar; no "YOU" header label.
+                let bar_st = if sel { theme::selected() } else { theme::accent() };
+                let txt_st = if sel { theme::selected() } else { theme::bold() };
+                let wrapped = if e.body.is_empty() {
+                    vec![String::new()]
+                } else {
+                    wrap(&e.body, width.saturating_sub(3))
+                };
+                for l in wrapped {
+                    lines.push(Line::from(vec![
+                        Span::styled("┃ ", bar_st),
+                        Span::styled(l, txt_st),
+                    ]));
+                }
+            }
+            EntryKind::Thinking => {
+                // Gray text, no left vertical bar.
+                let head_st = if sel { theme::selected() } else { theme::thinking() };
+                if e.collapsed {
+                    let preview = first_line(&e.body, width.saturating_sub(16));
+                    let label = if preview.is_empty() {
+                        "▸ Thinking".to_string()
+                    } else {
+                        format!("▸ Thinking · {preview}")
+                    };
+                    lines.push(Line::styled(label, head_st));
+                } else {
+                    lines.push(Line::styled("▾ Thinking", head_st));
+                    if !e.body.is_empty() {
+                        for l in wrap(&e.body, width.saturating_sub(3)) {
+                            lines.push(Line::styled(format!("  {l}"), theme::thinking()));
+                        }
+                    }
+                }
+            }
+            EntryKind::Text => {
+                // Pure white response text, no left vertical bar, no "ASSISTANT" header.
+                let txt_st = if sel { theme::selected() } else { theme::base() };
+                if !e.body.is_empty() {
+                    for l in wrap(&e.body, width.saturating_sub(1)) {
+                        lines.push(Line::styled(l, txt_st));
+                    }
+                }
+            }
+            EntryKind::ToolUse => {
+                let arrow = if e.collapsed { "▸" } else { "▾" };
+                let spin = if app.timeline.tool_pending(i) {
+                    format!(" {}", SPINNER[i % 4])
+                } else {
+                    String::new()
+                };
+                let head_st = if sel { theme::selected() } else { theme::muted() };
+                lines.push(Line::styled(format!("{arrow} tool · {}{spin}", e.title), head_st));
+                if !e.collapsed && !e.body.is_empty() {
+                    for l in wrap(&e.body, width.saturating_sub(3)) {
+                        lines.push(Line::styled(format!("  {l}"), theme::faint()));
+                    }
+                }
+            }
+            EntryKind::ToolResult => {
+                let arrow = if e.collapsed { "▸" } else { "▾" };
+                let head_st = if sel { theme::selected() } else { theme::muted() };
+                let mut spans = vec![Span::styled(format!("{arrow} result · {}", e.title), head_st)];
+                if e.is_error {
+                    spans.push(Span::styled(" ", theme::base()));
+                    spans.push(Span::styled(" ERROR ", theme::error()));
+                }
+                lines.push(Line::from(spans));
+                if !e.collapsed && !e.body.is_empty() {
+                    let body_st = if e.is_error { theme::bold() } else { theme::faint() };
+                    for l in wrap(&e.body, width.saturating_sub(3)) {
+                        lines.push(Line::styled(format!("  {l}"), body_st));
+                    }
+                }
+            }
+            EntryKind::Shell => {
+                let arrow = if e.collapsed { "▸" } else { "▾" };
+                let head_st = if sel { theme::selected() } else { theme::shell() };
+                let mut spans = vec![Span::styled(format!("{arrow} $ {}", e.title), head_st)];
+                if e.is_error {
+                    spans.push(Span::styled(" ", theme::base()));
+                    spans.push(Span::styled(" ERROR ", theme::error()));
+                }
+                lines.push(Line::from(spans));
+                if !e.collapsed && !e.body.is_empty() {
+                    for l in wrap(&e.body, width.saturating_sub(3)) {
+                        lines.push(Line::styled(format!("  {l}"), theme::muted()));
+                    }
+                }
+            }
+            EntryKind::Error => {
+                let head_st = if sel { theme::selected() } else { theme::error() };
+                lines.push(Line::from(vec![Span::styled(" ERROR ", head_st)]));
+                if !e.body.is_empty() {
+                    for l in wrap(&e.body, width.saturating_sub(3)) {
+                        lines.push(Line::styled(format!("  {l}"), theme::bold()));
+                    }
+                }
+            }
+            EntryKind::System => {
+                if !e.body.is_empty() {
+                    let st = if sel { theme::selected() } else { theme::faint() };
+                    for l in wrap(&e.body, width.saturating_sub(1)) {
+                        lines.push(Line::styled(l, st));
+                    }
+                }
             }
         }
+
         lines.push(Line::styled("", theme::base()));
     }
     (lines, starts)
 }
 
-fn entry_header(
-    app: &App,
-    i: usize,
-    e: &Entry,
-) -> (Vec<(String, ratatui::style::Style)>, ratatui::style::Style, ratatui::style::Style) {
-    let fold = if e.collapsed { "[+]" } else { "[-]" };
-    match e.kind {
-        EntryKind::User => (vec![("▶ YOU".into(), theme::badge())], theme::accent(), theme::bold()),
-        EntryKind::Text => (vec![("● ASSISTANT".into(), theme::bold())], theme::accent(), theme::base()),
-        EntryKind::Thinking => (
-            vec![(format!("◆ THINKING {fold} ({} chars)", e.body.chars().count()), theme::thinking())],
-            theme::thinking(),
-            theme::thinking(),
-        ),
-        EntryKind::ToolUse => {
-            let spin = if app.timeline.tool_pending(i) { format!(" {}", SPINNER[i % 4]) } else { String::new() };
-            (vec![(format!("⚙ TOOL {fold} {}{spin}", e.title), theme::tool())], theme::tool(), theme::muted())
-        }
-        EntryKind::ToolResult => {
-            let mut h = vec![(format!("↳ RESULT {fold} {}", e.title), theme::bold())];
-            if e.is_error {
-                h.push((" ".into(), theme::base()));
-                h.push((" ERROR ".into(), theme::error()));
-            }
-            (h, if e.is_error { theme::error() } else { theme::tool() }, if e.is_error { theme::bold() } else { theme::muted() })
-        }
-        EntryKind::Shell => {
-            let mut h = vec![(format!("$ SHELL {fold} {}", e.title), theme::shell())];
-            if e.is_error {
-                h.push((" ".into(), theme::base()));
-                h.push((" ERROR ".into(), theme::error()));
-            }
-            (h, theme::shell(), theme::base())
-        }
-        EntryKind::Error => (vec![(" ERROR ".into(), theme::error())], theme::error(), theme::bold()),
-        EntryKind::System => (vec![("— system —".into(), theme::faint())], theme::faint(), theme::faint()),
-    }
-}
-
 fn draw_timeline(f: &mut Frame, area: Rect, app: &App) {
-    let pad = if area.width > 70 { 2 } else { 0 };
+    let pad = if area.width > 44 { 2 } else { 1 };
     let inner = Rect::new(
         area.x + pad,
         area.y,
@@ -613,26 +648,12 @@ fn draw_timeline(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    let t = app.timeline.turn_usage;
-    let s = app.timeline.total_usage;
-    let status = Line::from(vec![
-        Span::styled(format!(" {} ", app.status), theme::bold()),
-        Span::styled(
-            format!(
-                "│ TOKENS in {} · out {} · total {} · ${:.4} ",
-                fmt_num(s.input.max(t.input)),
-                fmt_num(s.output.max(t.output)),
-                fmt_num(s.total.max(t.total)),
-                s.cost.max(t.cost)
-            ),
-            theme::footer(),
-        ),
-        Span::styled(
-            "│ Ctrl+P palette · /sessions · /models · /cd · Ctrl+B board · F1 help · Ctrl+Q quit",
-            theme::faint(),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(status).style(theme::footer()), area);
+    let line = if app.status.is_empty() {
+        Line::raw("")
+    } else {
+        Line::styled(format!("  {}", app.status), theme::faint())
+    };
+    f.render_widget(Paragraph::new(line).style(theme::footer()), area);
 }
 
 fn draw_sessions_modal(f: &mut Frame, area: Rect, app: &App) {

@@ -51,7 +51,7 @@ pub fn execute(app: &mut App, client: &NexusClient, action: Action) {
             execute(app, client, Action::RefreshSessions);
             execute(app, client, Action::RefreshModels { force: false });
             execute(app, client, Action::RefreshHarnessCommands);
-            app.set_status("Connected · / commands · @ files · ! shell · Ctrl+P palette");
+            app.set_status("");
         }
         Action::RefreshProjects => {
             let req = ListProjectsRequest { skip_disk_check: Some(true), force_refresh: None };

@@ -137,27 +137,67 @@ fn home_vs_active_chat_screen_and_optional_sidebar() {
     assert!(!a.sidebar_open);
     assert_eq!(a.focus, Focus::Input);
 
-    // Home screen: no fixed left PROJECTS / SESSIONS box, shows centered hero + tips + input card
+    // Home screen: pure black background, single unified project path, no OpenCode UX or command hints
     let home_buf = render(&a);
     let home_txt = text(&home_buf);
     assert!(home_txt.contains("ASD-NEXUS"));
-    assert!(home_txt.contains("Autonomous Multi-Harness Workspace"));
-    assert!(home_txt.contains("/sessions"));
-    assert!(home_txt.contains("/models"));
+    assert_eq!(home_txt.matches("C:/repo").count(), 1, "project_root must appear in one unified place only");
+    assert!(!home_txt.contains("OpenCode UX"));
+    assert!(!home_txt.contains("Ctrl+P palette"));
+    assert!(!home_txt.contains("/sessions"));
     assert!(!home_txt.contains("PROJECTS"));
 
+    // Verify pure black background on main canvas in DarkColor mode
+    let bg_cell = &home_buf[(0, 1)]; // gap row directly below header
+    assert_eq!(bg_cell.bg, ratatui::style::Color::Rgb(0, 0, 0));
+
+    // Verify input card symmetry & zero vertical shift when typing
+    let empty_rect = a.ui_regions.borrow().input_rect.unwrap();
+    for dy in 0..empty_rect.height {
+        let sym = home_buf[(empty_rect.x, empty_rect.y + dy)].symbol();
+        assert_eq!(sym, "┃", "every row of input card must carry left bar (row {dy})");
+    }
+    type_str(&mut a, "hi");
+    let typed_buf = render(&a);
+    let typed_rect = a.ui_regions.borrow().input_rect.unwrap();
+    assert_eq!(empty_rect, typed_rect, "typing 1 line must not shift input card");
+    for dy in 0..typed_rect.height {
+        let sym = typed_buf[(typed_rect.x, typed_rect.y + dy)].symbol();
+        assert_eq!(sym, "┃", "every row of typed input card must carry left bar (row {dy})");
+    }
+    a.handle_key(key(KeyCode::Backspace));
+    a.handle_key(key(KeyCode::Backspace));
+
     // Transition to Active chat screen when timeline has entries
-    a.timeline.push(Entry::new(EntryKind::User, "Hello OpenCode UX"));
-    a.timeline.push(Entry::new(EntryKind::Text, "Welcome to the open layout"));
+    a.timeline.push(Entry::new(EntryKind::User, "Hello world"));
+    a.timeline.push(Entry::new(EntryKind::Thinking, "analyzing request"));
+    a.timeline.push(Entry::new(EntryKind::Text, "Clean white response"));
     assert!(!a.is_home());
     let chat_buf = render(&a);
     let chat_txt = text(&chat_buf);
-    assert!(chat_txt.contains("┃ ▶ YOU"));
-    assert!(chat_txt.contains("Hello OpenCode UX"));
-    assert!(chat_txt.contains("┃ ● ASSISTANT"));
-    assert!(chat_txt.contains("Welcome to the open layout"));
-    assert!(!chat_txt.contains("Autonomous Multi-Harness Workspace"));
+    // Header separation: row 1 is pure empty gap so ASD-NEXUS never connects to user bar
+    let row1: String = (0..chat_buf.area.width).map(|x| chat_buf[(x, 1)].symbol()).collect();
+    assert!(row1.trim().is_empty(), "row below header must be an empty spacer");
+    // User message has left bar only, no YOU label
+    assert!(chat_txt.contains("┃ Hello world"));
+    assert!(!chat_txt.contains("YOU"));
+    // AI Thinking & Response have NO left bar and NO ASSISTANT label
+    assert!(chat_txt.contains("▸ Thinking · analyzing request"));
+    assert!(!chat_txt.contains("┃ ▸ Thinking"));
+    assert!(chat_txt.contains("Clean white response"));
+    assert!(!chat_txt.contains("ASSISTANT"));
+    assert!(!chat_txt.contains("┃ Clean white response"));
+    assert_eq!(chat_txt.matches("C:/repo").count(), 1);
     assert!(!chat_txt.contains("PROJECTS"));
+
+    // Verify AI Thinking is gray and AI Response is pure white in DarkColor mode
+    let lines: Vec<&str> = chat_txt.lines().collect();
+    let think_y = lines.iter().position(|l| l.contains("▸ Thinking")).unwrap() as u16;
+    let think_x = lines[think_y as usize].chars().position(|c| c == '▸').unwrap() as u16;
+    assert!(theme::is_grayscale(chat_buf[(think_x, think_y)].fg), "AI thinking must be gray");
+    let ans_y = lines.iter().position(|l| l.contains("Clean white response")).unwrap() as u16;
+    let ans_x = lines[ans_y as usize].chars().position(|c| c == 'C').unwrap() as u16;
+    assert_eq!(chat_buf[(ans_x, ans_y)].fg, ratatui::style::Color::Rgb(255, 255, 255));
 
     // Optional `/sidebar` toggles left drawer
     type_str(&mut a, "/sidebar");
@@ -304,7 +344,7 @@ fn at_file_autocomplete_and_bang_shell_execution() {
     assert!(a.timeline.entries[0].title.contains("!echo hello_nexus [exit 0]"));
     assert!(a.timeline.entries[0].body.contains("hello_nexus"));
     let sh_txt = text(&render(&a));
-    assert!(sh_txt.contains("$ SHELL [-] !echo hello_nexus [exit 0]"));
+    assert!(sh_txt.contains("▾ $ !echo hello_nexus [exit 0]"));
     assert!(sh_txt.contains("hello_nexus"));
 }
 
@@ -898,7 +938,7 @@ fn streaming_timeline_over_mpsc_and_cancel() {
     a.drain_stream();
     assert!(a.is_streaming());
     let s = text(&render(&a));
-    assert!(s.contains("THINKING [+]") && s.contains("TOOL [+] grep") && s.contains("STREAMING"));
+    assert!(s.contains("▸ Thinking") && s.contains("▸ tool · grep") && s.contains("STREAMING"));
 
     a.handle_key(ctrl('x'));
     assert_eq!(a.take_actions(), vec![Action::CancelTurn]);
@@ -918,13 +958,13 @@ fn streaming_timeline_over_mpsc_and_cancel() {
     let kinds: Vec<_> = a.timeline.entries.iter().map(|e| e.kind).collect();
     assert_eq!(
         kinds,
-        vec![EntryKind::User, EntryKind::Thinking, EntryKind::ToolUse, EntryKind::ToolResult, EntryKind::Text, EntryKind::System]
+        vec![EntryKind::User, EntryKind::Thinking, EntryKind::ToolUse, EntryKind::ToolResult, EntryKind::Text]
     );
     assert_eq!(a.timeline.entries[3].title, "grep");
     let buf = render(&a);
     let s = text(&buf);
     assert!(s.contains("Answer"));
-    assert!(s.contains("1,200") && s.contains("$0.0123"));
+    assert!(s.contains("1,234") && s.contains("$0.0123"));
     assert_monochrome(&buf);
 }
 

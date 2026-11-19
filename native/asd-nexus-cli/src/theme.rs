@@ -52,22 +52,22 @@ pub const FG: Color = Color::White;
 pub const MUTED: Color = Color::Gray;
 pub const FAINT: Color = Color::DarkGray;
 
-// DarkColor (OpenCode slate) constants
-pub const DARK_BG: Color = Color::Rgb(13, 15, 20);
-pub const DARK_SURFACE: Color = Color::Rgb(22, 26, 35);
-pub const DARK_PANEL: Color = Color::Rgb(18, 22, 30);
-pub const DARK_HEADER: Color = Color::Rgb(17, 20, 28);
-pub const DARK_FOOTER: Color = Color::Rgb(15, 18, 25);
-pub const DARK_FG: Color = Color::Rgb(230, 235, 243);
-pub const DARK_MUTED: Color = Color::Rgb(148, 160, 180);
-pub const DARK_FAINT: Color = Color::Rgb(96, 106, 126);
+// DarkColor constants (pure black canvas + minimal accents)
+pub const DARK_BG: Color = Color::Rgb(0, 0, 0);
+pub const DARK_SURFACE: Color = Color::Rgb(20, 20, 20);
+pub const DARK_PANEL: Color = Color::Rgb(15, 15, 15);
+pub const DARK_HEADER: Color = Color::Rgb(0, 0, 0);
+pub const DARK_FOOTER: Color = Color::Rgb(0, 0, 0);
+pub const DARK_FG: Color = Color::Rgb(255, 255, 255);
+pub const DARK_MUTED: Color = Color::Rgb(150, 150, 150);
+pub const DARK_FAINT: Color = Color::Rgb(100, 100, 100);
+pub const DARK_THINKING: Color = Color::Rgb(140, 140, 140);
 pub const DARK_ACCENT: Color = Color::Rgb(122, 162, 247);
 pub const DARK_CYAN: Color = Color::Rgb(125, 207, 255);
-pub const DARK_PURPLE: Color = Color::Rgb(187, 154, 247);
 pub const DARK_AMBER: Color = Color::Rgb(224, 175, 104);
 pub const DARK_GREEN: Color = Color::Rgb(158, 206, 106);
 pub const DARK_RED: Color = Color::Rgb(247, 118, 142);
-pub const DARK_SEL_BG: Color = Color::Rgb(38, 46, 66);
+pub const DARK_SEL_BG: Color = Color::Rgb(36, 40, 52);
 
 /// Grayscale RGB helper: always emits r == g == b.
 pub const fn gray(v: u8) -> Color {
@@ -231,8 +231,8 @@ pub fn footer_for(m: ThemeMode) -> Style {
 
 pub fn thinking_for(m: ThemeMode) -> Style {
     match m {
-        ThemeMode::DarkColor => Style::default().fg(DARK_PURPLE).bg(DARK_BG).add_modifier(Modifier::ITALIC),
-        ThemeMode::Monochrome => muted_for(m).add_modifier(Modifier::ITALIC),
+        ThemeMode::DarkColor => Style::default().fg(DARK_THINKING).bg(DARK_BG),
+        ThemeMode::Monochrome => muted_for(m),
     }
 }
 

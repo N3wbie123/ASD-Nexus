@@ -46,6 +46,22 @@ pub struct ChatState {
     pub pending_permissions: VecDeque<(String, PermissionRequestPayload)>,
 }
 
+/// An in-flight (or recently finished) turn kept alive in the background while the
+/// user inspects another session or opens `+ New Chat`.
+pub struct BackgroundTurn {
+    pub seq: u64,
+    pub project_root: String,
+    pub harness: String,
+    pub model: Option<String>,
+    pub auto_approve: bool,
+    pub asd_session_id: Option<String>,
+    pub harness_session_id: Option<String>,
+    pub timeline: Timeline,
+    pub handle: Option<TurnStreamHandle>,
+    pub cancel_requested: bool,
+    pub pending_permissions: VecDeque<(String, PermissionRequestPayload)>,
+}
+
 impl Default for ChatState {
     fn default() -> Self {
         Self {
@@ -157,6 +173,7 @@ pub enum PaletteAction {
     SwitchMode(PrimaryMode),
     SwitchDashboardTab(Tab),
     ToggleTheme,
+    OpenFolder,
     SwitchHarness(usize),
     SelectModel(usize, Option<String>),
     SwitchProject(String),
@@ -197,6 +214,7 @@ pub struct NexusApp {
     pub palette_query: String,
     pub palette_selected: usize,
     pub chat: ChatState,
+    pub background_turns: std::collections::BTreeMap<u64, BackgroundTurn>,
     pub board: BoardState,
     pub plan: PlanEditor,
     pub diff: DiffState,
@@ -235,6 +253,60 @@ fn basename(p: &str) -> String {
         .unwrap_or_else(|| p.to_string())
 }
 
+fn truncate_middle(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars || max_chars < 8 {
+        return s.to_string();
+    }
+    let head_len = (max_chars - 1) / 2;
+    let tail_len = max_chars - 1 - head_len;
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s.chars().skip(count - tail_len).collect();
+    format!("{head}…{tail}")
+}
+
+/// Extract `(asd_session_id, harness_session_id)` from an `OrchestratorEvent`.
+fn extract_event_session_ids(evt: &OrchestratorEvent) -> (Option<String>, Option<String>) {
+    let raw_asd = evt
+        .raw
+        .as_ref()
+        .and_then(|v| v.get("asdSessionId"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let raw_harness = evt
+        .raw
+        .as_ref()
+        .and_then(|v| v.get("harnessSessionId"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let asd_sid = raw_asd.or_else(|| {
+        evt.session_id
+            .as_deref()
+            .filter(|id| id.starts_with("asd-"))
+            .map(str::to_string)
+    });
+    let harness_sid = raw_harness.or_else(|| {
+        evt.session_id
+            .as_deref()
+            .filter(|id| !id.is_empty() && !id.starts_with("asd-"))
+            .map(str::to_string)
+    });
+    (asd_sid, harness_sid)
+}
+
+/// Query whether a Thinking timeline entry (`e.id`) is currently expanded.
+pub fn is_thinking_open(ctx: &egui::Context, entry_id: u64) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new(("thinking_open", entry_id))).unwrap_or(false))
+}
+
+/// Last rendered bounding rect of a Thinking timeline entry (`e.id`), for hit-test verification.
+pub fn thinking_card_rect(ctx: &egui::Context, entry_id: u64) -> Option<egui::Rect> {
+    ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("thinking_rect", entry_id))))
+}
+
 impl NexusApp {
     pub fn new(project_root: impl AsRef<Path>, run: RunOptions) -> Self {
         Self {
@@ -258,6 +330,7 @@ impl NexusApp {
             palette_query: String::new(),
             palette_selected: 0,
             chat: ChatState::default(),
+            background_turns: std::collections::BTreeMap::new(),
             board: BoardState::default(),
             plan: PlanEditor::default(),
             diff: DiffState::default(),
@@ -411,21 +484,84 @@ impl NexusApp {
         self.refresh_subagents();
     }
 
+    /// Park the currently foregrounded streaming turn into `background_turns` so
+    /// switching sessions or opening `+ New Chat` never kills an in-flight response.
+    fn park_active_turn_if_streaming(&mut self) {
+        let Some(seq) = self.chat.turn_seq.take() else {
+            return;
+        };
+        let harness = self.chat.harness().to_string();
+        let harness_sid = self
+            .selected_session
+            .as_ref()
+            .filter(|(h, _)| h == &harness)
+            .map(|(_, id)| id.clone())
+            .or_else(|| {
+                self.chat
+                    .timeline
+                    .harness_session_id
+                    .as_deref()
+                    .filter(|id| !id.starts_with("asd-"))
+                    .map(str::to_string)
+            });
+        let bg = BackgroundTurn {
+            seq,
+            project_root: self.project_root.clone(),
+            harness,
+            model: self.chat.picker.selected.clone(),
+            auto_approve: self.chat.auto_approve,
+            asd_session_id: self.active_session_id.clone(),
+            harness_session_id: harness_sid,
+            timeline: std::mem::take(&mut self.chat.timeline),
+            handle: self.chat.handle.take(),
+            cancel_requested: self.chat.cancel_requested,
+            pending_permissions: std::mem::take(&mut self.chat.pending_permissions),
+        };
+        self.chat.cancel_requested = false;
+        self.background_turns.insert(seq, bg);
+    }
+
+    fn find_matching_background_turn(&self, s: &DiscoveredSessionItem) -> Option<u64> {
+        self.background_turns
+            .iter()
+            .rev()
+            .find(|(_, bg)| {
+                let asd_match = s.asd_session_id.is_some() && bg.asd_session_id == s.asd_session_id;
+                let harness_match = bg.harness == s.harness
+                    && bg.harness_session_id.as_deref() == Some(s.harness_session_id.as_str());
+                asd_match || harness_match
+            })
+            .map(|(&seq, _)| seq)
+    }
+
+    pub fn has_running_background_turns(&self) -> bool {
+        self.background_turns.values().any(|bg| bg.timeline.streaming)
+    }
+
+    fn session_background_state(&self, s: &DiscoveredSessionItem) -> (bool, bool) {
+        let Some(seq) = self.find_matching_background_turn(s) else {
+            return (false, false);
+        };
+        let Some(bg) = self.background_turns.get(&seq) else {
+            return (false, false);
+        };
+        (bg.timeline.streaming, !bg.pending_permissions.is_empty())
+    }
+
     /// Switch the active project (rail selection, `/cd`, or OS folder picker).
     pub fn switch_project(&mut self, root: String) {
         let root = clean_root(Path::new(&root));
         if root == self.project_root && !self.sessions.is_empty() {
             return;
         }
+        self.park_active_turn_if_streaming();
         self.project_root = root.clone();
         self.sessions.clear();
         self.selected_session = None;
         self.active_session_id = None;
         self.chat.new_session_draft = true;
         self.chat.pending_permissions.clear();
-        if !self.chat.is_streaming() {
-            self.chat.timeline.clear();
-        }
+        self.chat.timeline.clear();
         self.chat.fs_entries.clear();
         self.chat.last_at_prefix = None;
         self.board = BoardState::default();
@@ -467,11 +603,9 @@ impl NexusApp {
     }
 
     /// Enter a fresh New Session draft (unlocks the harness selector without
-    /// creating a backend session until the user sends a prompt).
+    /// cancelling or interrupting any turn running in another session).
     pub fn start_new_session_draft(&mut self) {
-        if self.chat.is_streaming() {
-            self.cancel_turn();
-        }
+        self.park_active_turn_if_streaming();
         self.chat.new_session_draft = true;
         self.selected_session = None;
         self.active_session_id = None;
@@ -512,10 +646,20 @@ impl NexusApp {
         }
     }
 
-    /// Select an existing session from the left sidebar (follows the session's
-    /// harness without overwriting or creating a new session, and locks harness).
+    /// Select an existing session from the left sidebar. Any turn currently
+    /// streaming in another session keeps running in `background_turns`, and if
+    /// the selected session itself has an active/completed background turn, it
+    /// is seamlessly reattached.
     pub fn select_session(&mut self, idx: usize) {
         let Some(s) = self.sessions.get(idx).cloned() else { return };
+        let already_selected = !self.chat.new_session_draft
+            && self.selected_session.as_ref() == Some(&(s.harness.clone(), s.harness_session_id.clone()));
+        if already_selected && self.chat.is_streaming() {
+            return;
+        }
+
+        self.park_active_turn_if_streaming();
+
         self.chat.new_session_draft = false;
         self.chat.auto_approve = s.auto_approve.unwrap_or(true);
         self.chat.pending_permissions.clear();
@@ -531,17 +675,46 @@ impl NexusApp {
         }
         self.chat.picker.selected = s.model.clone();
         self.terminal.resume = None;
-        if !self.chat.is_streaming() {
+
+        if let Some(seq) = self.find_matching_background_turn(&s) {
+            if let Some(bg) = self.background_turns.remove(&seq) {
+                if self.active_session_id.is_none() && bg.asd_session_id.is_some() {
+                    self.active_session_id = bg.asd_session_id;
+                }
+                if bg.model.is_some() && self.chat.picker.selected.is_none() {
+                    self.chat.picker.selected = bg.model;
+                }
+                self.chat.auto_approve = bg.auto_approve;
+                self.chat.timeline = bg.timeline;
+                if self.chat.timeline.streaming {
+                    self.chat.turn_seq = Some(bg.seq);
+                    self.chat.handle = bg.handle;
+                    self.chat.cancel_requested = bg.cancel_requested;
+                    self.chat.pending_permissions = bg.pending_permissions;
+                } else {
+                    // Finished while in background: show cached timeline immediately and sync full disk history.
+                    self.request(Request::Transcript(GetTranscriptRequest {
+                        harness: s.harness.clone(),
+                        harness_session_id: s.harness_session_id.clone(),
+                        project_root: Some(s.project_root.clone()),
+                        transcript_path: s.transcript_path.clone(),
+                        max_messages: Some(400),
+                        before: None,
+                    }));
+                }
+            }
+        } else {
             self.chat.timeline.clear();
+            self.request(Request::Transcript(GetTranscriptRequest {
+                harness: s.harness.clone(),
+                harness_session_id: s.harness_session_id.clone(),
+                project_root: Some(s.project_root.clone()),
+                transcript_path: s.transcript_path.clone(),
+                max_messages: Some(400),
+                before: None,
+            }));
         }
-        self.request(Request::Transcript(GetTranscriptRequest {
-            harness: s.harness.clone(),
-            harness_session_id: s.harness_session_id.clone(),
-            project_root: Some(s.project_root.clone()),
-            transcript_path: s.transcript_path.clone(),
-            max_messages: Some(400),
-            before: None,
-        }));
+
         if self.active_session_id.is_some() {
             self.refresh_board();
             self.load_plan(false);
@@ -780,8 +953,7 @@ impl NexusApp {
             "cd" => {
                 self.chat.composer.clear();
                 if arg.is_empty() {
-                    self.palette_open = true;
-                    self.palette_query = "project:".into();
+                    self.pick_folder();
                 } else {
                     let target = if Path::new(arg).is_absolute() {
                         PathBuf::from(arg)
@@ -1075,10 +1247,15 @@ impl NexusApp {
             },
             Reply::Transcript(r) => match r {
                 Ok(t) => {
-                    if !self.chat.is_streaming() {
-                        self.chat.timeline.load_transcript(&t.messages);
+                    let matches_selected = !self.chat.new_session_draft
+                        && self.selected_session.as_ref()
+                            == Some(&(t.harness.clone(), t.harness_session_id.clone()));
+                    if matches_selected && !self.chat.is_streaming() {
+                        if !t.messages.is_empty() || self.chat.timeline.entries.is_empty() {
+                            self.chat.timeline.load_transcript(&t.messages);
+                        }
+                        self.set_status(format!("transcript: {} messages", t.messages.len()));
                     }
-                    self.set_status(format!("transcript: {} messages", t.messages.len()));
                 }
                 Err(e) => self.set_status(format!("transcript: {e}")),
             },
@@ -1252,70 +1429,132 @@ impl NexusApp {
                 self.set_status(msg);
             }
             Reply::TurnStarted { seq, handle } => {
-                if self.chat.turn_seq != Some(seq) {
-                    return;
-                }
-                match handle {
-                    Ok(h) => {
-                        if self.chat.cancel_requested {
-                            self.chat.cancel_requested = false;
+                if self.chat.turn_seq == Some(seq) {
+                    match handle {
+                        Ok(h) => {
+                            if self.chat.cancel_requested {
+                                self.chat.cancel_requested = false;
+                                self.chat.turn_seq = None;
+                                self.request(Request::CancelTurn(h));
+                            } else {
+                                self.chat.handle = Some(h);
+                            }
+                        }
+                        Err(e) => {
+                            self.chat.timeline.apply(&StreamMessage::Error(e.clone()));
+                            self.chat.timeline.end_turn(None);
                             self.chat.turn_seq = None;
-                            self.request(Request::CancelTurn(h));
-                        } else {
-                            self.chat.handle = Some(h);
+                            self.chat.cancel_requested = false;
+                            self.chat.pending_permissions.clear();
+                            self.set_status(format!("turn failed: {e}"));
                         }
                     }
-                    Err(e) => {
-                        self.chat.timeline.apply(&StreamMessage::Error(e.clone()));
-                        self.chat.timeline.end_turn(None);
-                        self.chat.turn_seq = None;
-                        self.chat.cancel_requested = false;
-                        self.chat.pending_permissions.clear();
-                        self.set_status(format!("turn failed: {e}"));
+                } else if let Some(bg) = self.background_turns.get_mut(&seq) {
+                    match handle {
+                        Ok(h) => {
+                            if bg.cancel_requested {
+                                self.background_turns.remove(&seq);
+                                self.request(Request::CancelTurn(h));
+                            } else {
+                                bg.handle = Some(h);
+                            }
+                        }
+                        Err(e) => {
+                            bg.timeline.apply(&StreamMessage::Error(e));
+                            bg.timeline.end_turn(None);
+                            bg.handle = None;
+                            bg.pending_permissions.clear();
+                        }
                     }
                 }
             }
             Reply::Stream { seq, msg } => {
-                if self.chat.turn_seq != Some(seq) || self.chat.cancel_requested {
-                    return;
-                }
-                if let StreamMessage::Event(ref evt) = msg {
-                    if self.active_session_id.is_none() {
-                        let asd_sid = evt
-                            .raw
-                            .as_ref()
-                            .and_then(|v| v.get("asdSessionId"))
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                            .or_else(|| {
-                                evt.session_id
-                                    .as_deref()
-                                    .filter(|id| id.starts_with("asd-"))
-                                    .map(str::to_string)
-                            });
-                        if let Some(sid) = asd_sid {
-                            self.active_session_id = Some(sid);
+                if self.chat.turn_seq == Some(seq) {
+                    if self.chat.cancel_requested {
+                        return;
+                    }
+                    let mut discovered_new_session = false;
+                    if let StreamMessage::Event(ref evt) = msg {
+                        let (asd_sid, harness_sid) = extract_event_session_ids(evt);
+                        if self.active_session_id.is_none() {
+                            if let Some(sid) = asd_sid {
+                                self.active_session_id = Some(sid);
+                                discovered_new_session = true;
+                            }
+                        }
+                        if self.selected_session.is_none() {
+                            if let Some(h_sid) = harness_sid {
+                                self.selected_session = Some((self.chat.harness().to_string(), h_sid));
+                                discovered_new_session = true;
+                            }
+                        }
+                        if evt.kind == OrchestratorEventKind::PermissionRequest {
+                            if let Some(perm) = evt.permission_request.clone() {
+                                let tid = evt
+                                    .turn_id
+                                    .clone()
+                                    .or_else(|| self.chat.timeline.turn_id.clone())
+                                    .or_else(|| self.chat.handle.as_ref().and_then(|h| h.turn_id()))
+                                    .unwrap_or_default();
+                                self.chat.pending_permissions.push_back((tid, perm));
+                            }
                         }
                     }
-                    if evt.kind == OrchestratorEventKind::PermissionRequest {
-                        if let Some(perm) = evt.permission_request.clone() {
-                            let tid = evt
-                                .turn_id
-                                .clone()
-                                .or_else(|| self.chat.timeline.turn_id.clone())
-                                .or_else(|| self.chat.handle.as_ref().and_then(|h| h.turn_id()))
-                                .unwrap_or_default();
-                            self.chat.pending_permissions.push_back((tid, perm));
+                    self.chat.timeline.apply(&msg);
+                    if !self.chat.timeline.streaming {
+                        self.chat.turn_seq = None;
+                        self.chat.handle = None;
+                        self.chat.pending_permissions.clear();
+                        self.set_status(format!("turn done · {}", self.chat.timeline.turn_usage.readout()));
+                        self.request(Request::Sessions { project_root: self.project_root.clone() });
+                    } else if discovered_new_session {
+                        self.request(Request::Sessions { project_root: self.project_root.clone() });
+                    }
+                } else if let Some(bg) = self.background_turns.get_mut(&seq) {
+                    if bg.cancel_requested {
+                        return;
+                    }
+                    let mut discovered_new_session = false;
+                    if let StreamMessage::Event(ref evt) = msg {
+                        let (asd_sid, harness_sid) = extract_event_session_ids(evt);
+                        if bg.asd_session_id.is_none() {
+                            if let Some(sid) = asd_sid {
+                                bg.asd_session_id = Some(sid);
+                                discovered_new_session = true;
+                            }
+                        }
+                        if bg.harness_session_id.is_none() {
+                            if let Some(h_sid) = harness_sid {
+                                bg.harness_session_id = Some(h_sid);
+                                discovered_new_session = true;
+                            }
+                        }
+                        if evt.kind == OrchestratorEventKind::PermissionRequest {
+                            if let Some(perm) = evt.permission_request.clone() {
+                                let tid = evt
+                                    .turn_id
+                                    .clone()
+                                    .or_else(|| bg.timeline.turn_id.clone())
+                                    .or_else(|| bg.handle.as_ref().and_then(|h| h.turn_id()))
+                                    .unwrap_or_default();
+                                bg.pending_permissions.push_back((tid, perm));
+                            }
                         }
                     }
-                }
-                self.chat.timeline.apply(&msg);
-                if !self.chat.timeline.streaming {
-                    self.chat.turn_seq = None;
-                    self.chat.handle = None;
-                    self.chat.pending_permissions.clear();
-                    self.set_status(format!("turn done · {}", self.chat.timeline.turn_usage.readout()));
-                    self.request(Request::Sessions { project_root: self.project_root.clone() });
+                    bg.timeline.apply(&msg);
+                    let finished = !bg.timeline.streaming;
+                    let bg_root = bg.project_root.clone();
+                    let bg_harness = bg.harness.clone();
+                    if finished {
+                        bg.handle = None;
+                        bg.pending_permissions.clear();
+                    }
+                    if finished {
+                        self.set_status(format!("background turn finished ({bg_harness})"));
+                        self.request(Request::Sessions { project_root: bg_root });
+                    } else if discovered_new_session {
+                        self.request(Request::Sessions { project_root: bg_root });
+                    }
                 }
             }
             Reply::TurnCancelled(r) => match r {
@@ -1472,16 +1711,15 @@ impl NexusApp {
         let p = theme::palette(self.theme_mode);
         let tm = self.theme_mode;
         ui.horizontal(|ui| {
-            let toggle_icon = if self.sidebar_open { "«" } else { "☰" };
-            if ui
-                .button(RichText::new(toggle_icon).color(p.text_hi))
-                .on_hover_text("Toggle Workspaces & Sessions sidebar")
+            // Keep 3-line hamburger icon constant whether sidebar is collapsed or expanded (vector-drawn so never renders □).
+            if hamburger_button(ui, p.text_hi)
+                .on_hover_text("Toggle sidebar")
                 .clicked()
             {
                 self.sidebar_open = !self.sidebar_open;
             }
 
-            ui.label(RichText::new("ASD NEXUS").strong().size(17.0).color(p.white));
+            ui.label(RichText::new("ASD NEXUS").strong().size(16.5).color(p.white));
             let (txt, st) = match &self.conn {
                 ConnState::Connected(_) => ("CONNECTED", theme::status_badge_for(tm, "connected")),
                 ConnState::Connecting => ("CONNECTING", theme::status_badge_for(tm, "connecting")),
@@ -1516,18 +1754,18 @@ impl NexusApp {
                 });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.backend.in_flight > 0 || self.chat.is_streaming() {
+                if self.backend.in_flight > 0 || self.chat.is_streaming() || self.has_running_background_turns() {
                     ui.spinner();
                 }
 
-                // [ Dark | Mono ] theme toggle button
+                // Theme toggle button
                 let theme_label = match self.theme_mode {
-                    ThemeMode::DarkColor => "Dark | Mono",
-                    ThemeMode::Monochrome => "Mono | Dark",
+                    ThemeMode::DarkColor => "Dark",
+                    ThemeMode::Monochrome => "Mono",
                 };
                 if ui
                     .button(RichText::new(theme_label).small().strong().color(p.text_hi))
-                    .on_hover_text("Toggle Antigravity Dark / Monochrome theme (/theme)")
+                    .on_hover_text("Toggle Dark / Monochrome theme (/theme)")
                     .clicked()
                 {
                     let ctx = ui.ctx().clone();
@@ -1536,7 +1774,7 @@ impl NexusApp {
 
                 // Ctrl+P Command Palette button
                 if ui
-                    .button(RichText::new("Ctrl+P").small().monospace().color(p.text_hi))
+                    .button(RichText::new("Ctrl+P").small().monospace().color(p.dim))
                     .on_hover_text("Open Command Palette (Ctrl+P / Ctrl+K)")
                     .clicked()
                 {
@@ -1545,16 +1783,17 @@ impl NexusApp {
                     self.palette_selected = 0;
                 }
 
-                // Current workspace folder badge (click to switch folder/project)
-                let ws_name = basename(&self.project_root);
-                if ui
-                    .button(RichText::new(format!("📁 {ws_name}")).small().color(p.text_hi))
-                    .on_hover_text(format!("{}\nClick to switch project", self.project_root))
-                    .clicked()
-                {
-                    self.palette_open = true;
-                    self.palette_query.clear();
-                    self.palette_selected = 0;
+                // Only show current workspace + Open in top bar when sidebar is hidden (no duplication).
+                if !self.sidebar_open {
+                    if ui
+                        .small_button(RichText::new("Open…").color(p.text_hi))
+                        .on_hover_text("Open another workspace folder")
+                        .clicked()
+                    {
+                        self.pick_folder();
+                    }
+                    ui.label(RichText::new(basename(&self.project_root)).small().color(p.dim))
+                        .on_hover_text(&self.project_root);
                 }
             });
         });
@@ -1582,67 +1821,54 @@ impl NexusApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(self.theme_mode);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&self.status).small().color(p.text));
+            ui.label(RichText::new(&self.status).small().color(p.muted));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let ConnState::Connected(u) = &self.conn {
-                    ui.label(RichText::new(u).small().monospace().color(p.muted));
+                let u = self.chat.timeline.total_usage;
+                if u.total > 0 {
+                    ui.label(
+                        RichText::new(format!("{} tok · ${:.4}", u.total, u.cost))
+                            .small()
+                            .monospace()
+                            .color(p.muted),
+                    );
                 }
-                if !self.font_status.is_empty() {
-                    ui.label(RichText::new(&self.font_status).small().color(p.muted));
-                }
-                ui.label(RichText::new(format!("theme: {}", self.theme_mode.label())).small().color(p.muted));
             });
         });
     }
 
-    // ---------------------------------------------------------------- left sidebar (Workspaces & Sessions)
+    // ---------------------------------------------------------------- left sidebar (Current Workspace & Sessions)
 
     fn rail(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(self.theme_mode);
         let tm = self.theme_mode;
 
         ui.horizontal(|ui| {
-            section_title(ui, "WORKSPACES", p);
+            section_title(ui, "WORKSPACE", p);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("«").on_hover_text("Collapse sidebar").clicked() {
-                    self.sidebar_open = false;
-                }
-                if ui.small_button("↻").on_hover_text("Refresh projects and sessions").clicked() {
-                    self.request(Request::Projects { force: true });
-                    self.request(Request::Sessions { project_root: self.project_root.clone() });
-                }
-                if ui.small_button("Open…").on_hover_text("Open Folder… (native OS folder picker)").clicked() {
+                if ui
+                    .small_button(RichText::new("Open…").color(p.text_hi))
+                    .on_hover_text("Open another workspace folder")
+                    .clicked()
+                {
                     self.pick_folder();
                 }
             });
         });
 
-        let current = basename(&self.project_root);
-        let mut switch_to = None;
-        let combo = egui::ComboBox::from_id_salt("project")
-            .selected_text(RichText::new(current).color(p.text_hi))
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                ScrollArea::vertical()
-                    .id_salt("project-list")
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        for proj in &self.projects {
-                            let sel = proj.project_root == self.project_root;
-                            let label = match proj.session_count {
-                                Some(n) => format!("{}  ·  {n}", basename(&proj.project_root)),
-                                None => basename(&proj.project_root),
-                            };
-                            if ui.selectable_label(sel, label).on_hover_text(&proj.project_root).clicked() && !sel {
-                                switch_to = Some(proj.project_root.clone());
-                            }
-                        }
-                    });
+        // Show ONLY the current workspace location (no multi-workspace dropdown list).
+        let current_name = basename(&self.project_root);
+        let cur_frame = Frame::none()
+            .fill(p.surface)
+            .stroke(Stroke::new(1.0_f32, p.border))
+            .inner_margin(Margin::symmetric(10.0, 7.0))
+            .rounding(Rounding::same(p.card_rounding))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(current_name).strong().color(p.text_hi));
+                let display_path = truncate_middle(&self.project_root, 34);
+                ui.label(RichText::new(display_path).small().monospace().color(p.muted));
             });
-        combo.response.on_hover_text(&self.project_root);
-        if let Some(r) = switch_to {
-            self.switch_project(r);
-        }
+        cur_frame.response.on_hover_text(&self.project_root);
 
         ui.add_space(6.0);
         if ui
@@ -1661,11 +1887,14 @@ impl NexusApp {
         ui.separator();
         ui.horizontal(|ui| {
             section_title(ui, "SESSIONS", p);
-            if let Some(id) = &self.active_session_id {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("↻").on_hover_text("Refresh sessions").clicked() {
+                    self.request(Request::Sessions { project_root: self.project_root.clone() });
+                }
+                if let Some(id) = &self.active_session_id {
                     ui.label(RichText::new(short_id(id)).small().monospace().color(p.muted));
-                });
-            }
+                }
+            });
         });
 
         ui.add(
@@ -1696,6 +1925,9 @@ impl NexusApp {
                     }
                 }
                 let sel = self.selected_session.as_ref() == Some(&(s.harness.clone(), s.harness_session_id.clone()));
+                let (bg_streaming, bg_needs_perm) = self.session_background_state(s);
+                let is_running = (sel && self.chat.is_streaming()) || bg_streaming;
+                let needs_perm = (sel && !self.chat.pending_permissions.is_empty()) || bg_needs_perm;
                 let title = s
                     .summary
                     .as_deref()
@@ -1710,27 +1942,51 @@ impl NexusApp {
                     Stroke::new(1.0_f32, p.border)
                 };
 
-                Frame::none()
+                // Full-card hit target so clicking anywhere on a session card selects it.
+                let mut frame = Frame::none()
                     .fill(card_fill)
                     .stroke(card_stroke)
                     .inner_margin(Margin::symmetric(8.0, 6.0))
                     .rounding(Rounding::same(p.card_rounding))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        let resp = ui.selectable_label(sel, RichText::new(title).strong().color(p.text_hi));
-                        if resp.clicked() {
-                            pick = Some(i);
+                    .begin(ui);
+                {
+                    let ui = &mut frame.content_ui;
+                    ui.set_width(ui.available_width());
+                    ui.add(
+                        egui::Label::new(RichText::new(title).strong().color(if sel { p.white } else { p.text_hi }))
+                            .selectable(false),
+                    );
+                    ui.horizontal(|ui| {
+                        if needs_perm {
+                            badge(ui, "APPROVAL", theme::status_badge_for(tm, "review"));
+                        } else if is_running {
+                            badge(ui, "RUNNING", theme::status_badge_for(tm, "running"));
                         }
-                        ui.horizontal(|ui| {
-                            if s.is_promoted_to_asd || s.asd_session_id.is_some() {
-                                badge(ui, "ASD", theme::status_badge_for(tm, "done"));
-                            }
-                            ui.label(RichText::new(&s.harness).small().color(p.dim));
-                            if let Some(m) = &s.model {
-                                ui.label(RichText::new(format!("· {m}")).small().color(p.muted));
-                            }
-                        });
+                        if s.is_promoted_to_asd || s.asd_session_id.is_some() {
+                            badge(ui, "ASD", theme::status_badge_for(tm, "done"));
+                        }
+                        ui.add(egui::Label::new(RichText::new(&s.harness).small().color(p.dim)).selectable(false));
+                        if let Some(m) = &s.model {
+                            ui.add(
+                                egui::Label::new(RichText::new(format!("· {m}")).small().color(p.muted))
+                                    .selectable(false),
+                            );
+                        }
                     });
+                }
+                let space = frame.allocate_space(ui);
+                let hit = ui.interact(space.rect, egui::Id::new(("sess_card", i)), egui::Sense::click());
+                if hit.hovered() {
+                    if !sel {
+                        frame.frame.fill = p.surface_hi;
+                        frame.frame.stroke = Stroke::new(1.0_f32, p.border_hi);
+                    }
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                frame.paint(ui);
+                if hit.clicked() {
+                    pick = Some(i);
+                }
                 ui.add_space(4.0);
             }
         });
@@ -1783,26 +2039,16 @@ impl NexusApp {
                     ui.vertical(|ui| {
                         ui.set_width(canvas_w);
                         if self.chat.timeline.entries.is_empty() {
-                            ui.add_space(24.0);
-                            Frame::none()
-                                .fill(p.surface)
-                                .stroke(Stroke::new(1.0_f32, p.border))
-                                .inner_margin(Margin::same(16.0))
-                                .rounding(Rounding::same(p.card_rounding))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.label(
-                                        RichText::new(format!("Antigravity Chat · {}", self.chat.harness()))
-                                            .strong()
-                                            .size(16.0)
-                                            .color(p.white),
-                                    );
-                                    ui.label(
-                                        RichText::new("Type a message below, use / for Nexus & harness commands, @ to reference workspace files, or Ctrl+P for the Command Palette.")
-                                            .small()
-                                            .color(p.dim),
-                                    );
-                                });
+                            ui.add_space((timeline_h * 0.34).max(28.0));
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new("ASD Nexus").strong().size(22.0).color(p.white));
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(format!("Multi-Harness Orchestrator · {}", self.chat.harness()))
+                                        .small()
+                                        .color(p.muted),
+                                );
+                            });
                         }
                         let total_entries = self.chat.timeline.entries.len();
                         let turn_usage = self.chat.timeline.turn_usage;
@@ -1944,7 +2190,7 @@ impl NexusApp {
                                     TextEdit::multiline(&mut self.chat.composer)
                                         .id(egui::Id::new("chat-composer"))
                                         .frame(false)
-                                        .hint_text("Ask anything… (/ for commands, @ for files, Enter to send, Shift+Enter for newline)")
+                                        .hint_text("Ask anything…")
                                         .desired_rows(3)
                                         .desired_width(ui.available_width())
                                         .return_key(Some(egui::KeyboardShortcut::new(
@@ -2079,19 +2325,7 @@ impl NexusApp {
                                 self.request(Request::Models { refresh: true });
                             }
 
-                            // 3) Current directory pill (/cd)
-                            let cur_dir = basename(&self.project_root);
-                            if ui
-                                .small_button(RichText::new(format!("📁 {cur_dir}")).color(p.dim))
-                                .on_hover_text(format!("{}\nClick to switch folder (/cd)", self.project_root))
-                                .clicked()
-                            {
-                                self.palette_open = true;
-                                self.palette_query.clear();
-                                self.palette_selected = 0;
-                            }
-
-                            // 4) Auto-Approve toggle pill (/auto-approve)
+                            // 3) Auto-Approve toggle pill (/auto-approve)
                             let auto_label = if self.chat.auto_approve { "Auto: ON" } else { "Auto: OFF" };
                             let auto_st = if self.chat.auto_approve {
                                 theme::status_badge_for(tm, "done")
@@ -2199,14 +2433,12 @@ impl NexusApp {
                 });
             }
         }
-        for p in &self.projects {
-            entries.push(PaletteEntry {
-                category: "Project",
-                label: format!("Project: {}", basename(&p.project_root)),
-                detail: p.project_root.clone(),
-                action: PaletteAction::SwitchProject(p.project_root.clone()),
-            });
-        }
+        entries.push(PaletteEntry {
+            category: "Workspace",
+            label: format!("Open Workspace… (current: {})", basename(&self.project_root)),
+            detail: self.project_root.clone(),
+            action: PaletteAction::OpenFolder,
+        });
         for (i, s) in self.sessions.iter().enumerate() {
             let title = s
                 .summary
@@ -2276,6 +2508,7 @@ impl NexusApp {
                     self.applied_theme = None;
                 }
             }
+            PaletteAction::OpenFolder => self.pick_folder(),
             PaletteAction::SwitchHarness(idx) => self.change_harness_manually(idx),
             PaletteAction::SelectModel(h_idx, model) => {
                 if h_idx != self.chat.harness_idx {
@@ -3136,6 +3369,37 @@ fn section_title(ui: &mut egui::Ui, t: &str, p: ThemePalette) {
     ui.label(RichText::new(t).small().strong().color(p.dim));
 }
 
+/// Vector-drawn 3-bar hamburger button (`☰`) — crisp at all DPIs and immune to missing font glyphs.
+fn hamburger_button(ui: &mut egui::Ui, color: Color32) -> egui::Response {
+    let resp = ui.add_sized([28.0, 26.0], egui::Button::new(""));
+    let rect = resp.rect;
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let half_w = 6.5_f32;
+    let stroke = Stroke::new(1.6_f32, color);
+    for dy in [-4.5_f32, 0.0, 4.5] {
+        ui.painter().line_segment(
+            [egui::pos2(cx - half_w, cy + dy), egui::pos2(cx + half_w, cy + dy)],
+            stroke,
+        );
+    }
+    resp
+}
+
+/// Vector-drawn disclosure chevron (`>` when closed, `v` when open) — zero font dependency, never renders `□`.
+fn paint_chevron(ui: &mut egui::Ui, is_open: bool, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
+    let c = rect.center();
+    let stroke = Stroke::new(1.5_f32, color);
+    if is_open {
+        ui.painter().line_segment([egui::pos2(c.x - 3.5, c.y - 1.5), egui::pos2(c.x, c.y + 2.5)], stroke);
+        ui.painter().line_segment([egui::pos2(c.x, c.y + 2.5), egui::pos2(c.x + 3.5, c.y - 1.5)], stroke);
+    } else {
+        ui.painter().line_segment([egui::pos2(c.x - 1.5, c.y - 3.5), egui::pos2(c.x + 2.5, c.y)], stroke);
+        ui.painter().line_segment([egui::pos2(c.x + 2.5, c.y), egui::pos2(c.x - 1.5, c.y + 3.5)], stroke);
+    }
+}
+
 /// Pill badge.
 pub fn badge(ui: &mut egui::Ui, text: &str, st: BadgeStyle) -> egui::Response {
     Frame::none()
@@ -3220,21 +3484,20 @@ fn entry_ui(
     is_last: bool,
     turn_usage: &Usage,
     total_usage: &Usage,
-    turn_id: Option<&str>,
+    _turn_id: Option<&str>,
 ) {
     match e.kind {
         EntryKind::User => {
             ui.horizontal(|ui| {
-                let indent = (ui.available_width() * 0.14).max(0.0);
+                let indent = (ui.available_width() * 0.16).max(0.0);
                 ui.add_space(indent);
                 Frame::none()
                     .fill(p.user_bubble)
                     .stroke(Stroke::new(1.0_f32, p.user_border))
                     .inner_margin(Margin::symmetric(12.0, 9.0))
-                    .rounding(Rounding::same(12.0))
+                    .rounding(Rounding::same(10.0))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new("YOU").small().strong().color(p.accent));
                         ui.label(RichText::new(&e.body).color(p.white));
                     });
             });
@@ -3260,27 +3523,59 @@ fn entry_ui(
             ui.label(RichText::new(format!("— {} —", e.body)).small().italics().color(p.muted));
         }
         EntryKind::Thinking => {
-            let id = ui.make_persistent_id(("entry", e.id));
-            let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
-            Frame::none()
+            // Entire Thinking card (icon, header, empty margin, padding, and expanded body) toggles open/closed.
+            let open_id = egui::Id::new(("thinking_open", e.id));
+            let rect_id = egui::Id::new(("thinking_rect", e.id));
+            let mut is_open = ui.ctx().data_mut(|d| *d.get_temp_mut_or(open_id, false));
+
+            let mut frame = Frame::none()
                 .fill(p.panel)
                 .stroke(Stroke::new(1.0_f32, p.border))
-                .inner_margin(Margin::symmetric(8.0, 4.0))
-                .rounding(Rounding::same(6.0))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    state
-                        .show_header(ui, |ui| {
-                            ui.label(RichText::new(e.thought_header()).small().italics().color(p.dim));
-                        })
-                        .body(|ui| {
-                            ui.label(RichText::new(&e.body).italics().color(p.dim));
-                        });
+                .inner_margin(Margin::symmetric(10.0, 7.0))
+                .rounding(Rounding::same(p.card_rounding))
+                .begin(ui);
+            {
+                let ui = &mut frame.content_ui;
+                ui.set_width(ui.available_width());
+                let header = if is_open {
+                    format!("Thought ({} chars)", e.body.chars().count())
+                } else {
+                    e.thought_header()
+                };
+                ui.horizontal(|ui| {
+                    paint_chevron(ui, is_open, p.dim);
+                    ui.add(
+                        egui::Label::new(RichText::new(header).small().italics().color(p.dim))
+                            .selectable(false),
+                    );
                 });
+                if is_open && !e.body.is_empty() {
+                    ui.add_space(5.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(&e.body).italics().color(p.dim))
+                            .selectable(false)
+                            .wrap(),
+                    );
+                }
+            }
+            let space_resp = frame.allocate_space(ui);
+            ui.ctx().data_mut(|d| d.insert_temp(rect_id, space_resp.rect));
+            let click_resp = ui.interact(space_resp.rect, open_id.with("hit"), egui::Sense::click());
+            if click_resp.hovered() {
+                frame.frame.fill = p.surface;
+                frame.frame.stroke = Stroke::new(1.0_f32, p.border_hi);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            frame.paint(ui);
+            if click_resp.clicked() {
+                is_open = !is_open;
+                ui.ctx().data_mut(|d| d.insert_temp(open_id, is_open));
+                ui.ctx().request_repaint();
+            }
         }
         EntryKind::ToolUse | EntryKind::ToolResult => {
-            let id = ui.make_persistent_id(("entry", e.id));
-            let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+            let open_id = egui::Id::new(("tool_open", e.id));
+            let mut is_open = ui.ctx().data_mut(|d| *d.get_temp_mut_or(open_id, false));
             let stroke = if e.is_error {
                 Stroke::new(1.5_f32, p.white)
             } else {
@@ -3289,23 +3584,24 @@ fn entry_ui(
             Frame::none()
                 .fill(p.surface)
                 .stroke(stroke)
-                .inner_margin(Margin::symmetric(8.0, 5.0))
+                .inner_margin(Margin::symmetric(9.0, 6.0))
                 .rounding(Rounding::same(p.card_rounding))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    state
-                        .show_header(ui, |ui| {
-                            let icon = if e.kind == EntryKind::ToolUse {
-                                "⚙"
-                            } else if e.is_error {
-                                "✗"
-                            } else {
-                                "✓"
-                            };
-                            ui.label(RichText::new(icon).small().strong().color(p.accent));
-                            ui.label(RichText::new(e.kind.label()).small().strong().color(p.dim));
+                    // Full-width clickable header row (Fitts's Law)
+                    let header_scope = ui.scope(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            paint_chevron(ui, is_open, p.muted);
+                            ui.add(
+                                egui::Label::new(RichText::new(e.kind.label()).small().strong().color(p.dim))
+                                    .selectable(false),
+                            );
                             if !e.title.is_empty() {
-                                ui.label(RichText::new(&e.title).monospace().strong().color(p.text_hi));
+                                ui.add(
+                                    egui::Label::new(RichText::new(&e.title).monospace().strong().color(p.text_hi))
+                                        .selectable(false),
+                                );
                             }
                             if e.pending {
                                 ui.spinner();
@@ -3315,24 +3611,41 @@ fn entry_ui(
                             }
                             let summary = e.compact_summary(52);
                             if !summary.is_empty() {
-                                ui.label(RichText::new(summary).small().monospace().color(p.muted));
+                                ui.add(
+                                    egui::Label::new(RichText::new(summary).small().monospace().color(p.muted))
+                                        .selectable(false),
+                                );
                             }
-                        })
-                        .body(|ui| {
-                            let body = if e.body.chars().count() > 8000 {
-                                e.body.chars().take(8000).collect::<String>() + "\n… (truncated)"
-                            } else {
-                                e.body.clone()
-                            };
-                            Frame::none()
-                                .fill(p.code_bg)
-                                .inner_margin(Margin::same(6.0))
-                                .rounding(Rounding::same(4.0))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.label(RichText::new(body).monospace().small().color(p.text));
-                                });
                         });
+                    });
+                    let mut full_hdr = header_scope.response.rect;
+                    full_hdr.max.x = ui.max_rect().max.x;
+                    let hdr_click = ui.interact(full_hdr, open_id.with("hit"), egui::Sense::click());
+                    if hdr_click.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if hdr_click.clicked() {
+                        is_open = !is_open;
+                        ui.ctx().data_mut(|d| d.insert_temp(open_id, is_open));
+                        ui.ctx().request_repaint();
+                    }
+
+                    if is_open && !e.body.is_empty() {
+                        ui.add_space(4.0);
+                        let body = if e.body.chars().count() > 8000 {
+                            e.body.chars().take(8000).collect::<String>() + "\n… (truncated)"
+                        } else {
+                            e.body.clone()
+                        };
+                        Frame::none()
+                            .fill(p.code_bg)
+                            .inner_margin(Margin::same(6.0))
+                            .rounding(Rounding::same(4.0))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(RichText::new(body).monospace().small().color(p.text));
+                            });
+                    }
                 });
         }
         EntryKind::Text => {
@@ -3346,23 +3659,14 @@ fn entry_ui(
                     render_assistant_markdown(ui, &e.body, p);
                     if is_last && (turn_usage.total > 0 || total_usage.total > 0) {
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("turn: {}", turn_usage.readout()))
-                                    .small()
-                                    .monospace()
-                                    .color(p.muted),
-                            );
-                            ui.label(
-                                RichText::new(format!("· session: {}", total_usage.readout()))
-                                    .small()
-                                    .monospace()
-                                    .color(p.muted),
-                            );
-                            if let Some(tid) = turn_id {
-                                ui.label(RichText::new(short_id(tid)).small().monospace().color(p.muted));
-                            }
-                        });
+                        let tot = total_usage.total.max(turn_usage.total);
+                        let cost = total_usage.cost.max(turn_usage.cost);
+                        ui.label(
+                            RichText::new(format!("{tot} tok · ${cost:.4}"))
+                                .small()
+                                .monospace()
+                                .color(p.muted),
+                        );
                     }
                 });
         }
